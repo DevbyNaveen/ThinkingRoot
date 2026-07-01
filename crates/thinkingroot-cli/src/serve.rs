@@ -429,6 +429,10 @@ pub async fn run_serve(
     // proactive "while you sleep" loop). Always on; cheap DB scan per tick.
     let _fn_scheduler_handle =
         thinkingroot_serve::maintenance::spawn_fn_scheduler(state.engine.clone());
+    // S7 — deliver declared actions from the outbox to the project webhook
+    // (no-op until TR_ACTION_WEBHOOK_URL is set).
+    let _action_delivery_handle =
+        thinkingroot_serve::maintenance::spawn_action_delivery(state.engine.clone());
 
     // Backstop GC for orphaned run/* branches (crash recovery: branches left
     // behind if settle_run_branch never ran). Best-effort; log on error, never
@@ -848,6 +852,10 @@ async fn run_serve_with_listener(
     // proactive "while you sleep" loop). Always on; cheap DB scan per tick.
     let _fn_scheduler_handle =
         thinkingroot_serve::maintenance::spawn_fn_scheduler(state.engine.clone());
+    // S7 — deliver declared actions from the outbox to the project webhook
+    // (no-op until TR_ACTION_WEBHOOK_URL is set).
+    let _action_delivery_handle =
+        thinkingroot_serve::maintenance::spawn_action_delivery(state.engine.clone());
 
     // Backstop GC for orphaned run/* branches (crash recovery).
     let _gc_run_branches_handle =

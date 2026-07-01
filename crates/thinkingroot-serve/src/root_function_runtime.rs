@@ -64,6 +64,15 @@ pub struct FnCtxMeta {
     /// Originating MCP session, when the invocation came from one. `None`
     /// for the session-less REST/flow path.
     pub session_id: Option<String>,
+    /// S6 — max journaled steps per run (0 = unlimited). Accidental-runaway guard.
+    pub max_steps: u32,
+    /// S6 — max `ctx.llm.ask` calls per run (0 = unlimited). Bounds LLM spend.
+    pub max_llm_calls: u32,
+    /// S9 — per-function egress denial (from `!CapSet.can_fetch`). Phrased as
+    /// DENY (not allow) so `derive(Default)` = `false` = permissive, preserving
+    /// the test/desktop path. Enforced in the JS fetch shim; the HARD egress
+    /// controls (project allowlist + SSRF) remain in `op_tr_fetch`.
+    pub deny_fetch: bool,
 }
 
 /// What a (possibly durable) run produced.
@@ -425,6 +434,11 @@ mod host_ext {
         pub version: i64,
         pub attempt: u32,
         pub session_id: Option<String>,
+        /// S6 — accidental-runaway breakers (0 = unlimited).
+        pub max_steps: u32,
+        pub max_llm_calls: u32,
+        /// S9 — per-function egress denial.
+        pub deny_fetch: bool,
     }
 
     /// Args for `op_tr_llm_ask`. A serde struct (not scalar `#[string]`
@@ -459,6 +473,9 @@ mod host_ext {
             version: m.version,
             attempt: m.attempt,
             session_id: m.session_id.clone(),
+            max_steps: m.max_steps,
+            max_llm_calls: m.max_llm_calls,
+            deny_fetch: m.deny_fetch,
         }
     }
 
@@ -1431,12 +1448,22 @@ globalThis.__tr_buildCtx = (input, env) => {
   // replay because durable control flow is deterministic — so the Nth
   // llm.ask / recall / remember always gets the same journal key.
   let __opSeq = 0;
+  // S6 — accidental-runaway breakers (0 = unlimited). Counts are stable across
+  // replay (a resumed run reproduces the same sequence), so a limit that was
+  // respected live is never tripped on replay; only a genuine runaway trips.
+  let __stepCount = 0;
+  let __llmCalls = 0;
   ctx.llm = {
     // Tools-blind coprocessor: ask the connected/configured model one
     // question. `context` is any JSON-serialisable value (optional).
     // JOURNALED: a replayed/resumed run returns the recorded answer and does
     // NOT re-call the model (determinism + no double-spend on resume).
     ask: async (question, context) => {
+      if (meta.maxLlmCalls > 0 && ++__llmCalls > meta.maxLlmCalls) {
+        throw new NonRetryableError(
+          `ctx.llm.ask limit exceeded (max_llm_calls=${meta.maxLlmCalls}) — runaway guard`
+        );
+      }
       return await ctx.step(`__llm__${__opSeq++}`, async () => {
         const r = await Deno.core.ops.op_tr_llm_ask({
           question: String(question),
@@ -1582,6 +1609,12 @@ globalThis.__tr_buildCtx = (input, env) => {
     const key = String(name);
     const hit = Deno.core.ops.op_tr_step_lookup({ key });
     if (hit.found) return JSON.parse(hit.result_json);
+    // S6 — count only genuinely-new (non-replayed) steps against the breaker.
+    if (meta.maxSteps > 0 && ++__stepCount > meta.maxSteps) {
+      throw new NonRetryableError(
+        `ctx.step limit exceeded (max_steps=${meta.maxSteps}) — runaway guard`
+      );
+    }
     const r = await fn();
     Deno.core.ops.op_tr_step_record({
       key,
@@ -1589,9 +1622,12 @@ globalThis.__tr_buildCtx = (input, env) => {
     });
     return r;
   };
-  // Determinism enforcement: route non-deterministic *sync* globals through
-  // the journal so a replayed run reproduces the original values instead of
-  // diverging. (fetch journaling + crypto come in the next sub-milestone.)
+  // Determinism enforcement (S3): route non-deterministic *sync* globals
+  // through the journal so a replayed run reproduces the original values
+  // instead of diverging. Covers Date.now, Math.random, the Date constructor,
+  // crypto.randomUUID/getRandomValues, and performance.now. Each shim is
+  // guarded so an absent or read-only global (deno_core minimal) never breaks
+  // the bootstrap — an un-shimmable source simply stays un-journaled.
   let __seq = 0;
   const __syncStep = (key, fn) => {
     const hit = Deno.core.ops.op_tr_step_lookup({ key });
@@ -1604,13 +1640,81 @@ globalThis.__tr_buildCtx = (input, env) => {
   Date.now = () => __syncStep(`__now__${__seq++}`, () => __realNow());
   const __realRandom = Math.random.bind(Math);
   Math.random = () => __syncStep(`__rand__${__seq++}`, () => __realRandom());
+  // The `Date` CONSTRUCTOR read live wall-clock directly (`new Date()` does NOT
+  // route through the overridden `Date.now`), so it diverged on replay. Wrap it
+  // so a zero-arg `new Date()` / `Date()` derives from the JOURNALED `Date.now()`
+  // above; explicit args (`new Date(ms)`, `new Date("2026-01-01")`) pass through
+  // unchanged (already deterministic).
+  try {
+    const __RealDate = Date;
+    const __JournaledNow = Date.now;
+    function __TRDate(...args) {
+      if (!(this instanceof __TRDate)) return new __RealDate(__JournaledNow()).toString();
+      return args.length === 0 ? new __RealDate(__JournaledNow()) : new __RealDate(...args);
+    }
+    __TRDate.prototype = __RealDate.prototype;
+    __TRDate.now = __JournaledNow;
+    __TRDate.parse = __RealDate.parse;
+    __TRDate.UTC = __RealDate.UTC;
+    globalThis.Date = __TRDate;
+  } catch (_) { /* Date non-configurable — leave the un-shimmed ctor */ }
+  // crypto.randomUUID / getRandomValues — journal so a replay reproduces the
+  // same identifiers/bytes instead of minting fresh ones (which broke step keys
+  // and any id persisted by the body).
+  try {
+    if (globalThis.crypto) {
+      if (typeof globalThis.crypto.randomUUID === 'function') {
+        const __realUUID = globalThis.crypto.randomUUID.bind(globalThis.crypto);
+        globalThis.crypto.randomUUID = () => __syncStep(`__uuid__${__seq++}`, () => __realUUID());
+      }
+      if (typeof globalThis.crypto.getRandomValues === 'function') {
+        const __realGRV = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+        globalThis.crypto.getRandomValues = (arr) => {
+          const vals = __syncStep(`__grv__${__seq++}`, () => { __realGRV(arr); return Array.from(arr); });
+          for (let i = 0; i < arr.length && i < vals.length; i++) arr[i] = vals[i];
+          return arr;
+        };
+      }
+    }
+  } catch (_) { /* crypto absent or props read-only — leave un-journaled */ }
+  // performance.now — monotonic wall-clock; journal it too.
+  try {
+    if (globalThis.performance && typeof globalThis.performance.now === 'function') {
+      const __realPerfNow = globalThis.performance.now.bind(globalThis.performance);
+      globalThis.performance.now = () => __syncStep(`__perf__${__seq++}`, () => __realPerfNow());
+    }
+  } catch (_) { /* performance absent or read-only */ }
   // Journal fetch: on a replayed run the recorded response is returned and
   // the network is NOT hit again (determinism + idempotency on resume). The
   // egress check still runs on the first, live call (inside __realFetch).
   const __realFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts = {}) => {
-    const j = await ctx.step(`__fetch__${__seq++}`, async () => {
-      const r = await __realFetch(url, opts);
+    // S9 — per-function egress gate. The project allowlist + SSRF vet (in the
+    // op) remain the hard controls; this narrows fetch off for a function whose
+    // grant sets can_fetch=false.
+    if (meta.denyFetch) {
+      throw new Error("egress denied: this function's grant does not include can_fetch");
+    }
+    const __fseq = __seq++;
+    const j = await ctx.step(`__fetch__${__fseq}`, async () => {
+      // S2 (crash-safe side-effects): for a mutating method, inject a STABLE
+      // Idempotency-Key derived from (runId, call-seq). If the engine crashes
+      // after the POST fires but before this step commits, the durable retry
+      // re-issues the SAME key, so an idempotency-aware remote (Stripe, Postal,
+      // …) dedupes instead of double-charging/double-sending. This is the only
+      // sound guarantee for an external effect — you cannot otherwise know the
+      // first attempt landed. An author-supplied Idempotency-Key always wins.
+      let o = opts || {};
+      const __method = (o.method || 'GET').toUpperCase();
+      if (__method !== 'GET' && __method !== 'HEAD') {
+        const h = Object.assign({}, o.headers || {});
+        const __has = Object.keys(h).some((k) => k.toLowerCase() === 'idempotency-key');
+        if (!__has) {
+          h['Idempotency-Key'] = `${ctx.runId}:${__fseq}`;
+          o = Object.assign({}, o, { headers: h });
+        }
+      }
+      const r = await __realFetch(url, o);
       return { status: r.status, ok: r.ok, headers: r.headers, body: await r.text() };
     });
     return {
@@ -1980,6 +2084,9 @@ mod deno_tests {
             version: 7,
             attempt: 1,
             session_id: None,
+            max_steps: 0,
+            max_llm_calls: 0,
+            deny_fetch: false,
         };
         let out = run_js(
             "(input, ctx) => ({ rid: ctx.runId, ws: ctx.ws, fn: ctx.fnName, \

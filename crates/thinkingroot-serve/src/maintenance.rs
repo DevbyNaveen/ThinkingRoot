@@ -766,6 +766,136 @@ pub fn spawn_fn_scheduler(
     spawn_periodic_task(task)
 }
 
+/// S7 — action outbox delivery worker. Reads due actions and POSTs each to the
+/// project's action webhook (`TR_ACTION_WEBHOOK_URL`), signed (blake3 over
+/// `secret‖body`, `TR_ACTION_SIGNING_SECRET`) with the action's `Idempotency-Key`.
+/// A 2xx = delivered → `sent`; otherwise exponential backoff → `failed`, and
+/// after `ACTION_MAX_ATTEMPTS` → `dead_letter`. If no webhook is configured the
+/// worker is a no-op (actions stay `pending` — never silently dropped).
+struct ActionDeliveryTask {
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    interval: Duration,
+    batch: usize,
+}
+
+const ACTION_MAX_ATTEMPTS: i64 = 8;
+
+#[async_trait]
+impl PeriodicTask for ActionDeliveryTask {
+    fn name(&self) -> &'static str {
+        "action_delivery"
+    }
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+    async fn run(&self) -> Result<(), thinkingroot_core::Error> {
+        let Ok(webhook) = std::env::var("TR_ACTION_WEBHOOK_URL") else {
+            return Ok(()); // not configured → leave actions pending (honest)
+        };
+        if webhook.trim().is_empty() {
+            return Ok(());
+        }
+        let secret = std::env::var("TR_ACTION_SIGNING_SECRET").unwrap_or_default();
+        let due = { self.engine.read().await.due_actions(self.batch).await };
+        if due.is_empty() {
+            return Ok(());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|e| thinkingroot_core::Error::Config(format!("action http client: {e}")))?;
+        for a in due {
+            // Sign the raw payload so the app can verify authenticity.
+            let sig = blake3::hash(format!("{secret}{}", a.payload_json).as_bytes()).to_hex();
+            let resp = client
+                .post(&webhook)
+                .header("Content-Type", "application/json")
+                .header("Idempotency-Key", &a.idempotency_key)
+                .header("X-TR-Signature", sig.as_str())
+                .header("X-TR-Action-Type", &a.action_type)
+                .header("X-TR-Connector", &a.connector)
+                .body(a.payload_json.clone())
+                .send()
+                .await;
+            let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let ok = resp.as_ref().map(|r| r.status().is_success()).unwrap_or(false);
+            let eng = self.engine.read().await;
+            if ok {
+                eng.update_action_delivery(&a.id, "sent", a.attempts + 1, "", 0.0).await;
+            } else {
+                let attempts = a.attempts + 1;
+                let err = match &resp {
+                    Ok(r) => format!("HTTP {}", r.status()),
+                    Err(e) => format!("send error: {e}"),
+                };
+                if attempts >= ACTION_MAX_ATTEMPTS {
+                    eng.update_action_delivery(&a.id, "dead_letter", attempts, &err, 0.0).await;
+                    // S8 — a permanently-undeliverable action fires its declared
+                    // compensation (saga rollback over an external effect), e.g.
+                    // `{ type:"send_email", compensate:{ type:"cancel_reservation", … } }`.
+                    if let Ok(payload) =
+                        serde_json::from_str::<serde_json::Value>(&a.payload_json)
+                    {
+                        if let Some(comp) = payload.get("compensate").filter(|c| c.is_object()) {
+                            let ctype = comp
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !ctype.is_empty() {
+                                let comp_action =
+                                    thinkingroot_graph::root_function::RootFunctionAction {
+                                        id: format!("{}:compensate", a.id),
+                                        run_id: a.run_id.clone(),
+                                        ws: a.ws.clone(),
+                                        fn_name: a.fn_name.clone(),
+                                        action_type: ctype,
+                                        connector: comp
+                                            .get("connector")
+                                            .and_then(|c| c.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        idempotency_key: format!("{}:compensate", a.idempotency_key),
+                                        payload_json: serde_json::to_string(comp)
+                                            .unwrap_or_default(),
+                                        status: "pending".to_string(),
+                                        attempts: 0,
+                                        last_error: String::new(),
+                                        created_at: now,
+                                        next_attempt_at: now,
+                                    };
+                                eng.enqueue_compensation(comp_action).await;
+                            }
+                        }
+                    }
+                } else {
+                    // Exponential backoff: 2^attempts secs, capped at 1h.
+                    let backoff = (2u64.saturating_pow(attempts as u32)).min(3600) as f64;
+                    eng.update_action_delivery(&a.id, "failed", attempts, &err, now + backoff)
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spawn the S7 action-delivery worker (no-op until `TR_ACTION_WEBHOOK_URL` is set).
+pub fn spawn_action_delivery(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+) -> JoinHandle<()> {
+    let interval_secs = std::env::var("TR_ACTION_DELIVERY_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10u64);
+    let task: Arc<dyn PeriodicTask> = Arc::new(ActionDeliveryTask {
+        engine,
+        interval: Duration::from_secs(interval_secs.max(5)),
+        batch: 50,
+    });
+    spawn_periodic_task(task)
+}
+
 /// Living Engram (Build 1) — idle decay of usage-learned associative edges.
 /// Multiplicatively pulls every edge toward a non-zero floor each run
 /// (`w ← floor + (w − floor)·factor`), so unused associations fade while a

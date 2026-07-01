@@ -110,6 +110,31 @@ pub struct FnWaiter {
     pub created_at: f64,
 }
 
+/// S7 — one declared side-effect from a function's `{ actions: [...] }` return,
+/// persisted in the `action_outbox` for durable, retried delivery to the
+/// project's action webhook. The engine NEVER fires the effect inline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RootFunctionAction {
+    pub id: String,
+    pub run_id: String,
+    pub ws: String,
+    pub fn_name: String,
+    /// e.g. `"send_email"`, `"sql.insert"` — the app's executor switches on this.
+    pub action_type: String,
+    /// Optional typed connector hint (e.g. `"postal"`); `""` = generic webhook.
+    pub connector: String,
+    /// Receiver dedupe token (crash-safe at-least-once + dedup ⇒ exactly-once).
+    pub idempotency_key: String,
+    /// JSON-encoded action body (to, subject, row, …).
+    pub payload_json: String,
+    /// `"pending"` | `"sent"` | `"failed"` | `"dead_letter"`.
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: String,
+    pub created_at: f64,
+    pub next_attempt_at: f64,
+}
+
 /// A control-plane-owned test fixture for a Root Function: an input and the
 /// expected JSON output. Authored separately from the function body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -232,6 +257,28 @@ fn row_to_run(row: &[DataValue]) -> RootFunctionRun {
         // Enriched from the fn_run_attribution sidecar by the caller; the bare
         // root_function_runs row carries no attribution.
         invoked_by: None,
+    }
+}
+
+/// S7 — row order matches the `action_outbox` column list used across the
+/// outbox queries (id, run_id, ws, fn_name, action_type, connector,
+/// idempotency_key, payload_json, status, attempts, last_error, created_at,
+/// next_attempt_at).
+fn row_to_action(row: &[DataValue]) -> RootFunctionAction {
+    RootFunctionAction {
+        id: dv_str(&row[0]),
+        run_id: dv_str(&row[1]),
+        ws: dv_str(&row[2]),
+        fn_name: dv_str(&row[3]),
+        action_type: dv_str(&row[4]),
+        connector: dv_str(&row[5]),
+        idempotency_key: dv_str(&row[6]),
+        payload_json: dv_str(&row[7]),
+        status: dv_str(&row[8]),
+        attempts: dv_i64(&row[9]),
+        last_error: dv_str(&row[10]),
+        created_at: dv_f64(&row[11]),
+        next_attempt_at: dv_f64(&row[12]),
     }
 }
 
@@ -596,6 +643,60 @@ impl GraphStore {
             .filter(|s| !s.is_empty()))
     }
 
+    /// Pin the function VERSION a run started on (durable-execution correctness,
+    /// S1) in the `fn_run_version` sidecar. Idempotent `:put` by run id — the
+    /// first (live) execution stamps it; resumes read it back to load the exact
+    /// body they began with instead of latest-by-name.
+    pub fn set_run_version(&self, run_id: &str, version: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        params.insert("version".into(), DataValue::Num(Num::Int(version)));
+        params.insert("recorded_at".into(), DataValue::Num(Num::Float(now)));
+        self.query(
+            "?[run_id, version, recorded_at] <- [[$run_id, $version, $recorded_at]] \
+             :put fn_run_version {run_id => version, recorded_at}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// The pinned version for a run, or `None` for a legacy/pre-S1 run (callers
+    /// then fall back to latest-by-name — back-compatible by default).
+    pub fn get_run_version(&self, run_id: &str) -> Result<Option<i64>> {
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[version] := *fn_run_version{run_id: $run_id, version}",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_run_version: {e}")))?;
+        Ok(rows.rows.first().map(|r| dv_i64(&r[0])))
+    }
+
+    /// Load a SPECIFIC version of a function by name (not latest). Used by the
+    /// resume path to replay a suspended run against the exact body it began on.
+    /// `None` if that (name, version) pair was deleted or never existed.
+    pub fn get_function_version(&self, name: &str, version: i64) -> Result<Option<RootFunction>> {
+        let mut params = BTreeMap::new();
+        params.insert("name".into(), DataValue::Str(name.into()));
+        params.insert("version".into(), DataValue::Num(Num::Int(version)));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[id, name, body, language, version, created_at] := \
+                 *root_functions{id, name, body, language, version, created_at}, \
+                 name = $name, version = $version",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("get_function_version: {e}")))?;
+        Ok(rows.rows.first().map(|r| row_to_function(r)))
+    }
+
     /// Runs for a function, most-recent first. Each run's `invoked_by` is joined
     /// in from the `fn_run_attribution` sidecar (`None` for unattributed runs).
     pub fn list_function_runs(&self, name: &str) -> Result<Vec<RootFunctionRun>> {
@@ -817,6 +918,58 @@ impl GraphStore {
         params.insert("id".into(), DataValue::Str(id.into()));
         self.query(
             "?[id] := *fn_timer{id}, id = $id\n:rm fn_timer {id}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    // ─── S4: cancel a run (delete every pending resume so it never wakes) ────
+
+    /// S4 — delete all pending timers (sleep/resume/retry) for a run. Idempotent.
+    pub fn delete_timers_for_run(&self, run_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        self.query(
+            "?[id] := *fn_timer{id, run_id}, run_id = $run_id\n:rm fn_timer {id}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// S4 — delete all event-waiters for a run (a suspended `ctx.waitForEvent`).
+    pub fn delete_waiters_for_run(&self, run_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        self.query(
+            "?[id] := *fn_waiter{id, run_id}, run_id = $run_id\n:rm fn_waiter {id}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// S4 — delete any outstanding cognition request for a run.
+    pub fn delete_pending_for_run(&self, run_id: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("run_id".into(), DataValue::Str(run_id.into()));
+        self.query(
+            "?[token] := *function_pending_requests{token, run_id}, run_id = $run_id\n\
+             :rm function_pending_requests {token}",
+            params,
+        )?;
+        Ok(())
+    }
+
+    /// S4 — set a run's status (e.g. `"cancelled"`) without disturbing its other
+    /// columns (read-modify-put by PK; no-op if the run row doesn't exist).
+    pub fn set_run_status(&self, run_id: &str, status: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".into(), DataValue::Str(run_id.into()));
+        params.insert("status".into(), DataValue::Str(status.into()));
+        self.query(
+            "?[id, function_name, status, started_at, finished_at, output_json, error] := \
+             *root_function_runs{id, function_name, started_at, finished_at, output_json, error}, \
+             id = $id, status = $status\n\
+             :put root_function_runs {id => function_name, status, started_at, finished_at, output_json, error}",
             params,
         )?;
         Ok(())
@@ -1318,6 +1471,111 @@ impl GraphStore {
             })
             .collect())
     }
+
+    // ─── S7: action outbox (durable, retried side-effect delivery) ──────
+
+    /// Enqueue one declared action for delivery. INSERT-IF-ABSENT by id: a run
+    /// that replays to completion (suspend→resume) re-declares the same actions,
+    /// so re-enqueue must NOT resurrect one already delivered. Existing id → no-op.
+    pub fn enqueue_action(&self, a: &RootFunctionAction) -> Result<()> {
+        let mut exists_p = BTreeMap::new();
+        exists_p.insert("id".into(), DataValue::Str(a.id.clone().into()));
+        let existing = self
+            .raw_db()
+            .run_script(
+                "?[id] := *action_outbox{id}, id = $id",
+                exists_p,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("enqueue_action exists: {e}")))?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+        let mut p = BTreeMap::new();
+        p.insert("id".into(), DataValue::Str(a.id.clone().into()));
+        p.insert("run_id".into(), DataValue::Str(a.run_id.clone().into()));
+        p.insert("ws".into(), DataValue::Str(a.ws.clone().into()));
+        p.insert("fn_name".into(), DataValue::Str(a.fn_name.clone().into()));
+        p.insert("action_type".into(), DataValue::Str(a.action_type.clone().into()));
+        p.insert("connector".into(), DataValue::Str(a.connector.clone().into()));
+        p.insert("idempotency_key".into(), DataValue::Str(a.idempotency_key.clone().into()));
+        p.insert("payload_json".into(), DataValue::Str(a.payload_json.clone().into()));
+        p.insert("status".into(), DataValue::Str(a.status.clone().into()));
+        p.insert("attempts".into(), DataValue::Num(Num::Int(a.attempts)));
+        p.insert("last_error".into(), DataValue::Str(a.last_error.clone().into()));
+        p.insert("created_at".into(), DataValue::Num(Num::Float(a.created_at)));
+        p.insert("next_attempt_at".into(), DataValue::Num(Num::Float(a.next_attempt_at)));
+        self.query(
+            "?[id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at] <- [[\
+             $id, $run_id, $ws, $fn_name, $action_type, $connector, $idempotency_key, $payload_json, $status, $attempts, $last_error, $created_at, $next_attempt_at]]\n\
+             :put action_outbox {id => run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at}",
+            p,
+        )?;
+        Ok(())
+    }
+
+    /// Deliverable actions: `pending`/`failed` whose `next_attempt_at` is due.
+    pub fn list_due_actions(&self, now: f64, limit: usize) -> Result<Vec<RootFunctionAction>> {
+        let mut p = BTreeMap::new();
+        p.insert("now".into(), DataValue::Num(Num::Float(now)));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at] := \
+                 *action_outbox{id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at}, \
+                 or(status == 'pending', status == 'failed'), next_attempt_at <= $now",
+                p,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_due_actions: {e}")))?;
+        let mut out: Vec<RootFunctionAction> = rows.rows.iter().map(|r| row_to_action(r)).collect();
+        out.sort_by(|a, b| a.created_at.total_cmp(&b.created_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// All actions for a run (observability / the run inspector).
+    pub fn list_actions_for_run(&self, run_id: &str) -> Result<Vec<RootFunctionAction>> {
+        let mut p = BTreeMap::new();
+        p.insert("run_id".into(), DataValue::Str(run_id.into()));
+        let rows = self
+            .raw_db()
+            .run_script(
+                "?[id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at] := \
+                 *action_outbox{id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at}, \
+                 run_id = $run_id",
+                p,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| Error::GraphStorage(format!("list_actions_for_run: {e}")))?;
+        Ok(rows.rows.iter().map(|r| row_to_action(r)).collect())
+    }
+
+    /// Mark an action's terminal/next state after a delivery attempt. Reads the
+    /// row and rewrites the mutable columns (PK = id); no-op if the row is gone.
+    pub fn update_action_delivery(
+        &self,
+        id: &str,
+        status: &str,
+        attempts: i64,
+        last_error: &str,
+        next_attempt_at: f64,
+    ) -> Result<()> {
+        let mut p = BTreeMap::new();
+        p.insert("id".into(), DataValue::Str(id.into()));
+        p.insert("status".into(), DataValue::Str(status.into()));
+        p.insert("attempts".into(), DataValue::Num(Num::Int(attempts)));
+        p.insert("last_error".into(), DataValue::Str(last_error.into()));
+        p.insert("next_attempt_at".into(), DataValue::Num(Num::Float(next_attempt_at)));
+        self.query(
+            "?[id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at] := \
+             *action_outbox{id, run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, created_at}, \
+             id = $id, status = $status, attempts = $attempts, last_error = $last_error, next_attempt_at = $next_attempt_at\n\
+             :put action_outbox {id => run_id, ws, fn_name, action_type, connector, idempotency_key, payload_json, status, attempts, last_error, created_at, next_attempt_at}",
+            p,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1329,6 +1587,126 @@ mod tests {
         let s = GraphStore::from_db_for_testing(db);
         s.init_for_testing().unwrap();
         s
+    }
+
+    // ─── S1: version-pinning (bug #1 — redeploy-during-sleep) ───────────
+    #[test]
+    fn run_version_pin_roundtrips_and_survives_redeploy() {
+        let s = store();
+        // v1 deployed; a run starts on it and gets pinned.
+        let v1 = s.put_function("welcome", "export default () => 1", "js").unwrap();
+        assert_eq!(v1.version, 1);
+        let run_id = "run_abc";
+        s.set_run_version(run_id, v1.version).unwrap();
+        assert_eq!(s.get_run_version(run_id).unwrap(), Some(1));
+
+        // The run "sleeps"; meanwhile v2 is deployed (latest moves to 2).
+        let v2 = s.put_function("welcome", "export default () => 2", "js").unwrap();
+        assert_eq!(v2.version, 2);
+        assert_eq!(s.function_latest_version("welcome").unwrap(), Some(2));
+
+        // On resume, latest-by-name would (wrongly) give v2's body...
+        assert!(s.get_function("welcome").unwrap().unwrap().body.contains("=> 2"));
+        // ...but the pinned load returns the EXACT body the run began on (v1).
+        let pinned_v = s.get_run_version(run_id).unwrap().unwrap();
+        let pinned = s.get_function_version("welcome", pinned_v).unwrap().unwrap();
+        assert_eq!(pinned.version, 1);
+        assert!(pinned.body.contains("=> 1"), "resume must replay the version it started on");
+    }
+
+    #[test]
+    fn unpinned_run_reads_none_backcompat() {
+        let s = store();
+        // A legacy/pre-S1 run has no sidecar row → None → callers fall back to latest.
+        assert_eq!(s.get_run_version("legacy_run").unwrap(), None);
+    }
+
+    // ─── S4: cancel a run (status + purge pending resumes) ──────────────
+    #[test]
+    fn cancel_run_marks_status_and_purges_timers() {
+        let s = store();
+        s.record_function_run(&RootFunctionRun {
+            id: "run_x".into(),
+            function_name: "welcome".into(),
+            status: "suspended".into(),
+            started_at: 1.0,
+            finished_at: 0.0,
+            output_json: String::new(),
+            error: String::new(),
+            invoked_by: None,
+        })
+        .unwrap();
+        // A pending sleep-timer for the run.
+        s.put_timer(&FnTimer {
+            id: "t1".into(),
+            scope: "main".into(),
+            fn_name: "welcome".into(),
+            kind: "resume".into(),
+            run_id: "run_x".into(),
+            fire_at: 99.0,
+            input_json: "{}".into(),
+            dedupe_key: String::new(),
+            status: "pending".into(),
+            created_at: 1.0,
+        })
+        .unwrap();
+
+        // Cancel: status → cancelled, timer purged so the ticker never wakes it.
+        s.set_run_status("run_x", "cancelled").unwrap();
+        s.delete_timers_for_run("run_x").unwrap();
+
+        let run = s
+            .list_function_runs("welcome")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "run_x")
+            .unwrap();
+        assert_eq!(run.status, "cancelled");
+        // No pending timer remains for the run.
+        let mut p = std::collections::BTreeMap::new();
+        p.insert("run_id".into(), cozo::DataValue::Str("run_x".into()));
+        let left = s
+            .raw_db()
+            .run_script(
+                "?[id] := *fn_timer{id, run_id}, run_id = $run_id",
+                p,
+                cozo::ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(left.rows.len(), 0, "cancelled run must have no live timer");
+    }
+
+    // ─── S7: action outbox ──────────────────────────────────────────────
+    #[test]
+    fn action_outbox_enqueue_due_and_deliver() {
+        let s = store();
+        let a = RootFunctionAction {
+            id: "act_1".into(),
+            run_id: "run_1".into(),
+            ws: "main".into(),
+            fn_name: "welcome".into(),
+            action_type: "send_email".into(),
+            connector: "postal".into(),
+            idempotency_key: "run_1:welcome".into(),
+            payload_json: r#"{"to":"a@b.com"}"#.into(),
+            status: "pending".into(),
+            attempts: 0,
+            last_error: String::new(),
+            created_at: 1.0,
+            next_attempt_at: 0.0,
+        };
+        s.enqueue_action(&a).unwrap();
+        // Due now (next_attempt_at <= now).
+        let due = s.list_due_actions(5.0, 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].idempotency_key, "run_1:welcome");
+        // Deliver → sent; no longer due.
+        s.update_action_delivery("act_1", "sent", 1, "", 0.0).unwrap();
+        assert_eq!(s.list_due_actions(5.0, 10).unwrap().len(), 0);
+        let all = s.list_actions_for_run("run_1").unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].status, "sent");
+        assert_eq!(all[0].attempts, 1);
     }
 
     #[test]

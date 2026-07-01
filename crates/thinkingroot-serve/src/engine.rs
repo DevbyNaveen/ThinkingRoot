@@ -1171,6 +1171,40 @@ pub struct CapSet {
     /// P2c — when true the limit is PER SCOPE (per-user fairness: at most
     /// `limit` runs per `u_*`); else global to the function across all scopes.
     pub concurrency_per_scope: bool,
+    /// S5 — per-function wall-clock timeout in seconds (0 = engine default 30).
+    /// Clamped to `FN_TIMEOUT_MAX_SECS` at the invoke site. Long WAITS should use
+    /// `ctx.sleep` (suspend), not a long wall-clock; this bounds CPU-bound bodies.
+    #[serde(default)]
+    pub timeout_secs: u32,
+    /// S6 — max journaled steps per run (0 = unlimited). Circuit-breaker against
+    /// an accidental runaway loop (`while(true){ await ctx.step(...) }`).
+    #[serde(default)]
+    pub max_steps: u32,
+    /// S6 — max `ctx.llm.ask` calls per run (0 = unlimited). Bounds LLM spend for
+    /// a runaway loop. Guards ACCIDENTAL runaway, not adversarial evasion — the
+    /// hard adversarial bounds remain the 30s/128MB isolate limits.
+    #[serde(default)]
+    pub max_llm_calls: u32,
+    /// S9 — per-function egress gate for `fetch`. MISSING in a stored grant =
+    /// `true` (fetch was previously gated only at project level via
+    /// `TR_OUTBOUND_ALLOWLIST`, so a pre-S9 grant must not lose it); an explicit
+    /// `false` denies. `deny_all()` (parse failure) sets it false via derive.
+    #[serde(default = "cap_true")]
+    pub can_fetch: bool,
+    /// S10 — per-function rate limit in runs-per-minute (0 = unlimited). Enforced
+    /// by a token bucket keyed by function name: a burst beyond the minute budget
+    /// waits for a token (fair backpressure), capped so it can't wedge a caller.
+    /// Copy-safe scalar (per-KEY concurrency + debounce need a non-Copy config
+    /// home in `fn_attributes` — tracked as the S10 follow-up).
+    #[serde(default)]
+    pub rate_limit_rpm: u32,
+}
+
+/// Serde default for [`CapSet::can_fetch`]: a stored grant that predates the
+/// field keeps fetch enabled (no silent egress regression). `derive(Default)`
+/// still yields `false`, so `deny_all()` denies fetch.
+fn cap_true() -> bool {
+    true
 }
 
 impl CapSet {
@@ -1191,6 +1225,14 @@ impl CapSet {
             // Unlimited concurrency by default (opt-in fairness).
             concurrency_limit: 0,
             concurrency_per_scope: false,
+            // S5/S6 — no extra limits by default (0 = engine default / unlimited).
+            timeout_secs: 0,
+            max_steps: 0,
+            max_llm_calls: 0,
+            // S9 — egress on by default (project allowlist remains the real gate).
+            can_fetch: true,
+            // S10 — unlimited rate by default (opt-in).
+            rate_limit_rpm: 0,
         }
     }
 
@@ -1208,6 +1250,12 @@ impl CapSet {
     }
 }
 
+/// S5 — Root Function wall-clock timeout: the default when a grant sets none,
+/// and the hard ceiling a grant can request (so a bad value can't wedge a
+/// worker). Long WAITS use `ctx.sleep` (suspend), not a long wall-clock.
+const FN_TIMEOUT_DEFAULT_SECS: u32 = 30;
+const FN_TIMEOUT_MAX_SECS: u32 = 300;
+
 /// P2c — in-process fair semaphores for Root Function concurrency limits, keyed
 /// by `"{fn}:{scope|_global}"`. A permit is held for a run's duration (RAII), so
 /// `limit` bounds concurrent runs. Per-scope keys give per-user fairness. The
@@ -1216,6 +1264,76 @@ impl CapSet {
 static FN_CONCURRENCY: std::sync::OnceLock<
     tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
 > = std::sync::OnceLock::new();
+
+/// S11 — split an identifier or phrase into lowercase word tokens: break on
+/// non-alphanumeric AND camelCase boundaries (`welcomePenguin` → `welcome`,
+/// `penguin`), keeping runs of ≥3 chars. No model — cheap intent matching.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    let mut flush = |cur: &mut String, tokens: &mut Vec<String>| {
+        if cur.chars().count() >= 3 {
+            tokens.push(cur.to_lowercase());
+        }
+        cur.clear();
+    };
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if ch.is_uppercase() && prev_lower {
+                flush(&mut cur, &mut tokens);
+            }
+            cur.push(ch);
+            prev_lower = ch.is_lowercase();
+        } else {
+            flush(&mut cur, &mut tokens);
+            prev_lower = false;
+        }
+    }
+    flush(&mut cur, &mut tokens);
+    tokens
+}
+
+/// S10 — per-function token buckets for rate limiting (runs/min), keyed by
+/// function name. `(tokens, last_refill_epoch_secs)`. A run consumes one token;
+/// an empty bucket waits (bounded) for a refill. In-process, best-effort fair.
+static FN_RATE: std::sync::OnceLock<
+    tokio::sync::Mutex<std::collections::HashMap<String, (f64, f64)>>,
+> = std::sync::OnceLock::new();
+
+/// S10 — gate one invocation against the function's rate limit (runs/min).
+/// Refills continuously; if no token is available, sleeps for the shortfall
+/// (capped at 10s so a caller can't be wedged), then proceeds. `rpm == 0` is a
+/// no-op. Uses the Rust host clock (the JS-clock ban is for isolate bodies).
+async fn rate_limit_gate(name: &str, rpm: u32) {
+    if rpm == 0 {
+        return;
+    }
+    let capacity = rpm as f64;
+    let per_sec = capacity / 60.0;
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let wait = {
+        let map = FN_RATE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut guard = map.lock().await;
+        let entry = guard.entry(name.to_string()).or_insert((capacity, now));
+        // Refill by elapsed time, cap at capacity.
+        let elapsed = (now - entry.1).max(0.0);
+        entry.0 = (entry.0 + elapsed * per_sec).min(capacity);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            0.0
+        } else {
+            // Time until one token accrues; consume the token we're waiting for.
+            let deficit = 1.0 - entry.0;
+            entry.0 = 0.0;
+            (deficit / per_sec).min(10.0)
+        }
+    };
+    if wait > 0.0 {
+        tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
+    }
+}
 
 async fn acquire_concurrency_permit(key: String, limit: usize) -> tokio::sync::OwnedSemaphorePermit {
     let map =
@@ -4239,6 +4357,75 @@ impl QueryEngine {
         }
     }
 
+    /// S1 (durable-execution correctness): load a SPECIFIC pinned version of a
+    /// function, walking the inheritance chain (the body may live in the shared
+    /// or agent brain). Deliberately NO connect-gate — a run that is resuming
+    /// already passed the gate at first invoke and must not be blocked by a
+    /// mid-flight connectivity change. `None` if that version no longer exists.
+    pub async fn get_function_version(
+        &self,
+        ws: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<thinkingroot_graph::root_function::RootFunction>> {
+        let _ = self.get_workspace(ws)?;
+        for brain in self.inheritance_chain(ws) {
+            if let Ok(handle) = self.get_workspace(&brain) {
+                let storage = handle.storage.lock().await;
+                if let Some(f) = storage.graph.get_function_version(name, version)? {
+                    return Ok(Some(f));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// S1: the version a run was pinned to at first invoke. Lives in the calling
+    /// `ws` brain, co-located with the run's journal. `None` = legacy/pre-S1 run
+    /// (caller then falls back to latest-by-name — back-compatible by default).
+    async fn get_run_version(&self, ws: &str, run_id: &str) -> Result<Option<i64>> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        Ok(storage.graph.get_run_version(run_id).unwrap_or(None))
+    }
+
+    /// S1: pin a fresh run to the version it started on (idempotent `:put`).
+    /// Best-effort: a failure degrades to old latest-by-name resume, never a crash.
+    async fn set_run_version(&self, ws: &str, run_id: &str, version: i64) -> Result<()> {
+        let handle = self.get_workspace(ws)?;
+        let storage = handle.storage.lock().await;
+        let _ = storage.graph.set_run_version(run_id, version);
+        Ok(())
+    }
+
+    /// S4 — cancel a run: mark it `cancelled` and delete every pending resume
+    /// (sleep/retry timer, event-waiter, cognition request) so the scheduler
+    /// ticker never wakes it. The run row + cognition pending live in the
+    /// calling `ws` brain; durable timers/waiters are stored in the PRIMARY
+    /// brain (keyed by scope) — so both are cleared. Idempotent and best-effort
+    /// per store (a missing row is a no-op), so a partial failure never panics.
+    pub async fn cancel_run(&self, ws: &str, run_id: &str) -> Result<()> {
+        {
+            let handle = self.get_workspace(ws)?;
+            let storage = handle.storage.lock().await;
+            let _ = storage.graph.set_run_status(run_id, "cancelled");
+            let _ = storage.graph.delete_pending_for_run(run_id);
+            let _ = storage.graph.delete_timers_for_run(run_id);
+            let _ = storage.graph.delete_waiters_for_run(run_id);
+        }
+        if let Some(primary) = self.primary_ws_name() {
+            if primary != ws {
+                if let Ok(handle) = self.get_workspace(&primary) {
+                    let storage = handle.storage.lock().await;
+                    let _ = storage.graph.delete_timers_for_run(run_id);
+                    let _ = storage.graph.delete_waiters_for_run(run_id);
+                    let _ = storage.graph.delete_pending_for_run(run_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn get_function(
         &self,
         ws: &str,
@@ -4759,6 +4946,88 @@ impl QueryEngine {
         }
     }
 
+    /// S7 — the brain that owns the action outbox: the primary if there is one
+    /// (single scan point for the delivery worker, always mounted), else the
+    /// run's own scope (desktop/single-brain).
+    fn outbox_ws(&self, ws: &str) -> String {
+        self.primary_ws_name().unwrap_or_else(|| ws.to_string())
+    }
+
+    /// S7 — persist declared actions to the outbox (primary brain).
+    async fn enqueue_actions(&self, ws: &str, actions: &[thinkingroot_graph::root_function::RootFunctionAction]) {
+        if actions.is_empty() {
+            return;
+        }
+        let target = self.outbox_ws(ws);
+        if let Ok(handle) = self.get_workspace(&target) {
+            let storage = handle.storage.lock().await;
+            for a in actions {
+                let _ = storage.graph.enqueue_action(a);
+            }
+        }
+    }
+
+    /// S7 — due (pending/failed, backoff elapsed) actions for the delivery worker.
+    pub async fn due_actions(
+        &self,
+        limit: usize,
+    ) -> Vec<thinkingroot_graph::root_function::RootFunctionAction> {
+        let Some(primary) = self.primary_ws_name() else {
+            return Vec::new();
+        };
+        let Ok(handle) = self.get_workspace(&primary) else {
+            return Vec::new();
+        };
+        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_due_actions(now, limit).unwrap_or_default()
+    }
+
+    /// S8 — enqueue a compensating action (primary brain). Insert-if-absent, so
+    /// a repeated dead-letter can't double-fire the compensation.
+    pub async fn enqueue_compensation(
+        &self,
+        action: thinkingroot_graph::root_function::RootFunctionAction,
+    ) {
+        if let Some(primary) = self.primary_ws_name() {
+            if let Ok(handle) = self.get_workspace(&primary) {
+                let storage = handle.storage.lock().await;
+                let _ = storage.graph.enqueue_action(&action);
+            }
+        }
+    }
+
+    /// S7 — the outbox actions for a run + their delivery status (observability).
+    pub async fn list_run_actions(
+        &self,
+        ws: &str,
+        run_id: &str,
+    ) -> Result<Vec<thinkingroot_graph::root_function::RootFunctionAction>> {
+        let target = self.outbox_ws(ws);
+        let handle = self.get_workspace(&target)?;
+        let storage = handle.storage.lock().await;
+        storage.graph.list_actions_for_run(run_id)
+    }
+
+    /// S7 — record a delivery attempt's outcome (primary brain).
+    pub async fn update_action_delivery(
+        &self,
+        id: &str,
+        status: &str,
+        attempts: i64,
+        last_error: &str,
+        next_attempt_at: f64,
+    ) {
+        if let Some(primary) = self.primary_ws_name() {
+            if let Ok(handle) = self.get_workspace(&primary) {
+                let storage = handle.storage.lock().await;
+                let _ = storage
+                    .graph
+                    .update_action_delivery(id, status, attempts, last_error, next_attempt_at);
+            }
+        }
+    }
+
     /// P1b — register a durable RESUME timer in the primary brain (a `ctx.sleep`/
     /// `ctx.wakeAt` suspend). When due, the ticker records the wake step + re-
     /// enters `run_id`. `step_key` is the sleep journal key; `input_json` the
@@ -5056,9 +5325,15 @@ impl QueryEngine {
     ) -> Result<Vec<thinkingroot_graph::root_function::ExperienceEntry>> {
         use thinkingroot_graph::root_function::ExperienceEntry;
         let shape = Self::shape_of(input);
+        // S11 — lexical intent tokens from the input (keys + string values), used
+        // as a semantic TIE-BREAKER. Wilson experience still leads; overlap only
+        // orders functions the experience store can't yet distinguish — chiefly
+        // the cold start, where every score is 0 and pure shape-matching is blind.
+        // (Full embed+ANN over function descriptions is the deeper follow-up.)
+        let intent = Self::intent_tokens(input);
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        let mut out: Vec<ExperienceEntry> = Vec::new();
+        let mut scored: Vec<(ExperienceEntry, f64)> = Vec::new();
         for f in storage.graph.list_functions()? {
             let class = format!("{}:{}", f.name, shape);
             let entry = storage.graph.get_experience(&class, &f.name)?.unwrap_or(ExperienceEntry {
@@ -5067,11 +5342,56 @@ impl QueryEngine {
                 n_success: 0,
                 n_fail: 0,
             });
-            out.push(entry);
+            let overlap = Self::name_overlap(&intent, &f.name);
+            scored.push((entry, overlap));
         }
-        // Rank by confident success rate (Wilson lower bound), not raw volume.
-        out.sort_by(|a, b| b.score().total_cmp(&a.score()));
-        Ok(out)
+        // Rank by confident success rate (Wilson lower bound); break ties on the
+        // input↔name intent overlap so a cold-start pick is semantically sensible.
+        scored.sort_by(|a, b| {
+            b.0.score()
+                .total_cmp(&a.0.score())
+                .then(b.1.total_cmp(&a.1))
+        });
+        Ok(scored.into_iter().map(|(e, _)| e).collect())
+    }
+
+    /// S11 — lowercase intent tokens from an input JSON: object keys + the words
+    /// inside string values (alphanumeric runs, ≥3 chars). Cheap, allocation-
+    /// bounded, no model.
+    fn intent_tokens(input: &serde_json::Value) -> std::collections::HashSet<String> {
+        fn walk(v: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, val) in m {
+                        for t in tokenize(k) {
+                            out.insert(t);
+                        }
+                        walk(val, out);
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::String(s) => {
+                    for t in tokenize(s) {
+                        out.insert(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = std::collections::HashSet::new();
+        walk(input, &mut out);
+        out
+    }
+
+    /// S11 — fraction of a function name's tokens covered by the intent tokens.
+    /// `welcome_penguin` vs intent {welcome, penguin, …} → 1.0.
+    fn name_overlap(intent: &std::collections::HashSet<String>, fn_name: &str) -> f64 {
+        let name_tokens = tokenize(fn_name);
+        if name_tokens.is_empty() {
+            return 0.0;
+        }
+        let hits = name_tokens.iter().filter(|t| intent.contains(*t)).count();
+        hits as f64 / name_tokens.len() as f64
     }
 
     /// Capability-routing report (P5): every deployed function with its learned
@@ -5184,10 +5504,27 @@ impl QueryEngine {
             }
         }
 
-        let func = self
-            .get_function(ws, name)
-            .await?
-            .ok_or_else(|| Error::Template(format!("root function '{name}' is not deployed")))?;
+        // S1 (durable-execution correctness): pin the version a run starts on,
+        // and replay a resume/retry against THAT body — not latest-by-name.
+        // Without this, a `put_function` during a live `ctx.sleep` would resume
+        // an old journal against new code (step-key divergence → wrong branch or
+        // crash). Fresh run (no pin yet) → load latest + record the pin; resume
+        // or retry (pin present) → load the exact version it began on.
+        let func = match self.get_run_version(ws, run_id).await? {
+            Some(v) => self.get_function_version(ws, name, v).await?.ok_or_else(|| {
+                Error::Template(format!(
+                    "root function '{name}' pinned version {v} no longer exists \
+                     (deleted mid-run?)"
+                ))
+            })?,
+            None => {
+                let f = self.get_function(ws, name).await?.ok_or_else(|| {
+                    Error::Template(format!("root function '{name}' is not deployed"))
+                })?;
+                self.set_run_version(ws, run_id, f.version).await.ok();
+                f
+            }
+        };
 
         // Secret-backed env, from two sources:
         //  1. CLOUD: the provisioner injects each secret as a process env var
@@ -5214,7 +5551,7 @@ impl QueryEngine {
         }
 
         let started_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-        let ctx_meta = crate::root_function_runtime::FnCtxMeta {
+        let mut ctx_meta = crate::root_function_runtime::FnCtxMeta {
             run_id: run_id.to_string(),
             ws: ws.to_string(),
             fn_name: name.to_string(),
@@ -5223,6 +5560,10 @@ impl QueryEngine {
             // REST/flow invocation path is session-less; an MCP-originated
             // path will thread the real session id here in a later phase.
             session_id: None,
+            // S6/S9 limits are filled in once the CapSet is resolved below.
+            max_steps: 0,
+            max_llm_calls: 0,
+            deny_fetch: false,
         };
         // BYO-key oracle for ctx.llm: the workspace's configured LLM client
         // (None if the project has no provider key — ctx.llm then errors
@@ -5248,7 +5589,7 @@ impl QueryEngine {
         // reach the cognition graph WITHOUT re-locking the engine during the
         // run (avoids the writer-queue deadlock when a workspace mounts mid-run)
         // and stays confined to this (per-user) workspace.
-        let (caps, conc_limit, conc_per_scope) = {
+        let (caps, cap_set) = {
             let handle = self.get_workspace(ws)?.clone();
             // Slice 2b: `ctx.mcp.call` resolves connectors across the workspace's
             // inheritance chain (self → agent brain → shared), nearest-server-
@@ -5295,24 +5636,42 @@ impl QueryEngine {
                         .with_target_branch(target_branch.clone())
                         .with_primary_handle(primary_handle),
                 ),
-                cap_set.concurrency_limit,
-                cap_set.concurrency_per_scope,
+                cap_set,
             )
         };
 
         // P2c — hold a fair concurrency permit for the whole run (per-scope key =
         // per-user fairness; 0 = unlimited). The guard releases on return, so a
         // suspended run (sleep/event) frees its slot and re-acquires on resume.
-        let _conc_permit = if conc_limit > 0 {
-            let key = if conc_per_scope {
+        let _conc_permit = if cap_set.concurrency_limit > 0 {
+            let key = if cap_set.concurrency_per_scope {
                 format!("{name}:{ws}")
             } else {
                 format!("{name}:_global")
             };
-            Some(acquire_concurrency_permit(key, conc_limit as usize).await)
+            Some(acquire_concurrency_permit(key, cap_set.concurrency_limit as usize).await)
         } else {
             None
         };
+
+        // S10 — per-function rate limit (runs/min); waits for a token if over
+        // budget (0 = unlimited). Held after the concurrency permit so a limited
+        // burst queues fairly rather than erroring.
+        rate_limit_gate(name, cap_set.rate_limit_rpm).await;
+
+        // S5 — per-function timeout (0 = engine default), clamped so a bad grant
+        // can't wedge a worker. Long WAITS belong in ctx.sleep (suspend), not a
+        // long wall-clock; this bounds CPU-bound bodies.
+        let timeout_secs = if cap_set.timeout_secs == 0 {
+            FN_TIMEOUT_DEFAULT_SECS
+        } else {
+            cap_set.timeout_secs.min(FN_TIMEOUT_MAX_SECS)
+        };
+        // S6 — carry the accidental-runaway breakers into the isolate.
+        ctx_meta.max_steps = cap_set.max_steps;
+        ctx_meta.max_llm_calls = cap_set.max_llm_calls;
+        // S9 — per-function egress gate (deny when the grant withholds can_fetch).
+        ctx_meta.deny_fetch = !cap_set.can_fetch;
 
         let (outcome, new_steps, new_pending, new_cites) =
             crate::root_function_runtime::run_js_journaled(
@@ -5322,7 +5681,7 @@ impl QueryEngine {
                 ctx_meta,
                 llm,
                 prior_steps,
-                30,
+                timeout_secs as u64,
                 Some(caps),
             )
             .await;
@@ -5408,6 +5767,10 @@ impl QueryEngine {
         let mut resume_timers: Vec<(String, f64)> = Vec::new();
         // P2 — (step_key, event_name, timeout_epoch) for ctx.waitForEvent suspends.
         let mut event_waiters: Vec<(String, String, f64)> = Vec::new();
+        // S7 — declared actions collected here, enqueued to the outbox (primary
+        // brain) AFTER the scope journal persists.
+        let mut pending_actions: Vec<thinkingroot_graph::root_function::RootFunctionAction> =
+            Vec::new();
         {
             let handle = self.get_workspace(ws)?;
             let storage = handle.storage.lock().await;
@@ -5449,6 +5812,54 @@ impl QueryEngine {
             }
             let _ = storage.graph.record_function_run(&run);
 
+            // S7 — persist declared actions to the outbox for durable delivery.
+            // The body DECLARES effects by returning `{ actions: [...] }`; the
+            // engine NEVER fires them inline. The delivery worker POSTs them to
+            // the project action webhook with retry/backoff. Deterministic id per
+            // (run, index) + insert-if-absent = replay-safe (a resumed run that
+            // re-reaches Done cannot re-deliver or resurrect a sent action).
+            if let RunOutcome::Done(v) = &outcome {
+                if let Some(actions) = v.get("actions").and_then(|a| a.as_array()) {
+                    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                    for (i, act) in actions.iter().enumerate() {
+                        let action_type = act
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if action_type.is_empty() {
+                            continue; // skip a malformed action rather than enqueue junk
+                        }
+                        let connector = act
+                            .get("connector")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let idempotency_key = act
+                            .get("idempotencyKey")
+                            .and_then(|k| k.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("{run_id}:{i}"));
+                        let action = thinkingroot_graph::root_function::RootFunctionAction {
+                            id: format!("{run_id}:act:{i}"),
+                            run_id: run_id.to_string(),
+                            ws: ws.to_string(),
+                            fn_name: name.to_string(),
+                            action_type,
+                            connector,
+                            idempotency_key,
+                            payload_json: serde_json::to_string(act).unwrap_or_default(),
+                            status: "pending".to_string(),
+                            attempts: 0,
+                            last_error: String::new(),
+                            created_at: now,
+                            next_attempt_at: now, // due immediately
+                        };
+                        pending_actions.push(action);
+                    }
+                }
+            }
+
             // ── Run-learning (the moat) ──
             // A completed run is positive evidence for (input_class, fn); an
             // errored run is negative. A suspended run is incomplete — no
@@ -5478,6 +5889,10 @@ impl QueryEngine {
                 );
             }
         }
+
+        // S7 — enqueue declared actions to the outbox (primary brain) now that
+        // the scope journal is persisted, so the delivery worker can pick them up.
+        self.enqueue_actions(ws, &pending_actions).await;
 
         // P1b — register durable resume timers in the PRIMARY brain now that the
         // scope's journal is persisted. Each re-enters THIS run at `wake_at`

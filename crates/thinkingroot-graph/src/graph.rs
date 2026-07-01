@@ -1659,6 +1659,47 @@ impl GraphStore {
                 invoked_by: String default '',
                 recorded_at: Float default 0.0
             }",
+            // ─── fn_run_version — the function VERSION a run started on
+            //     (durable-execution correctness, S1). A SIDECAR keyed by run id,
+            //     same zero-migration rationale as fn_run_attribution above: a run
+            //     that suspends (ctx.sleep/waitForEvent) for days must, on resume,
+            //     replay its journal against the SAME body it began with — NOT
+            //     whatever `put_function` deployed in the meantime. Without this
+            //     pin, a redeploy during a live suspension replays an old journal
+            //     against new code (step-key divergence → wrong branch or crash).
+            //     A run with no row reads back as `None` → callers fall back to
+            //     latest-by-name, so every legacy/pre-S1 run is unaffected.
+            ":create fn_run_version {
+                run_id: String
+                =>
+                version: Int default 0,
+                recorded_at: Float default 0.0
+            }",
+            // ─── action_outbox — S7. Structured side-effects a function DECLARES
+            //     by returning `{ actions: [...] }`. The engine persists them
+            //     here (never fires them inline), and a delivery worker signs +
+            //     POSTs each to the project's action webhook with retry/backoff →
+            //     dead_letter. This is the clean brain/app split: TR plans the
+            //     action, the product app executes + records it. `status` is
+            //     'pending'|'sent'|'failed'|'dead_letter'; `idempotency_key` is
+            //     the receiver's dedupe token (crash-safe at-least-once + dedup =
+            //     effective exactly-once). PK is the action id (ULID).
+            ":create action_outbox {
+                id: String
+                =>
+                run_id: String default '',
+                ws: String default '',
+                fn_name: String default '',
+                action_type: String default '',
+                connector: String default '',
+                idempotency_key: String default '',
+                payload_json: String default '',
+                status: String default 'pending',
+                attempts: Int default 0,
+                last_error: String default '',
+                created_at: Float default 0.0,
+                next_attempt_at: Float default 0.0
+            }",
             // ─── root_function_steps — durable-execution journal. One row
             //     per completed ctx.step()/shimmed-nondeterminism call, so a
             //     suspended or crashed run REPLAYS recorded results instead

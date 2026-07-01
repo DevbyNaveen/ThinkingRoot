@@ -1007,6 +1007,23 @@ pub fn build_router_opts(state: Arc<AppState>, enable_rest: bool, enable_mcp: bo
                 "/ws/{ws}/functions/{name}/runs/{run_id}/steps",
                 get(function_steps_handler),
             )
+            // S4 — cancel a run: mark cancelled + purge every pending resume so
+            // the ticker never wakes it (e.g. a user unsubscribes mid-lifecycle).
+            .route(
+                "/ws/{ws}/functions/{name}/runs/{run_id}/cancel",
+                post(function_cancel_handler),
+            )
+            // S7 — the declared actions for a run + their delivery status
+            // (pending/sent/failed/dead_letter) — the outbox inspector.
+            .route(
+                "/ws/{ws}/functions/{name}/runs/{run_id}/actions",
+                get(function_actions_handler),
+            )
+            // S12 — unified run inspector: status + journal + actions on one call.
+            .route(
+                "/ws/{ws}/functions/{name}/runs/{run_id}",
+                get(function_run_detail_handler),
+            )
             // P2 — deliver an event to ctx.waitForEvent waiters in this scope
             // (external webhooks / cross-function signals).
             .route("/ws/{ws}/events", post(emit_event_handler))
@@ -2942,6 +2959,71 @@ async fn function_runs_handler(
         Ok(v) => ok_response(v).into_response(),
         Err(e) => match_engine_error(e),
     }
+}
+
+/// S4 — `POST /ws/{ws}/functions/{name}/runs/{run_id}/cancel` — mark a run
+/// cancelled and purge every pending resume so the ticker never wakes it.
+/// Idempotent: cancelling an already-terminal or unknown run is a no-op 200.
+async fn function_cancel_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, _name, run_id)): Path<(String, String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.cancel_run(&ws, &run_id).await {
+        Ok(()) => {
+            ok_response(serde_json::json!({ "run_id": run_id, "cancelled": true })).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// S7 — `GET /ws/{ws}/functions/{name}/runs/{run_id}/actions` — the declared
+/// actions for a run and their delivery status (the outbox inspector).
+async fn function_actions_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, _name, run_id)): Path<(String, String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    match engine.list_run_actions(&ws, &run_id).await {
+        Ok(actions) => {
+            ok_response(serde_json::json!({ "run_id": run_id, "actions": actions })).into_response()
+        }
+        Err(e) => match_engine_error(e),
+    }
+}
+
+/// S12 — `GET /ws/{ws}/functions/{name}/runs/{run_id}` — unified run inspector:
+/// the run record, its durable journal (with per-step latency), and its outbox
+/// actions in a single call. The "runs + actions on one screen" view.
+async fn function_run_detail_handler(
+    State(state): State<Arc<AppState>>,
+    Path((ws, name, run_id)): Path<(String, String, String)>,
+) -> Response {
+    let engine = state.engine.read().await;
+    let run = engine
+        .list_function_runs(&ws, &name)
+        .await
+        .ok()
+        .and_then(|runs| runs.into_iter().find(|r| r.id == run_id));
+    let steps: Vec<serde_json::Value> = engine
+        .list_function_steps(&ws, &run_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, result_json, recorded_at)| {
+            let result: serde_json::Value =
+                serde_json::from_str(&result_json).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({ "step": key, "result": result, "recorded_at": recorded_at })
+        })
+        .collect();
+    let actions = engine.list_run_actions(&ws, &run_id).await.unwrap_or_default();
+    ok_response(serde_json::json!({
+        "run_id": run_id,
+        "run": run,
+        "steps": steps,
+        "actions": actions,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
