@@ -824,6 +824,48 @@ async fn try_aggregation_answer(
         .collect();
 
     let answer = match kind {
+        // SUM (memory-SOTA Phase 5): exact per-unit totals over the byte-
+        // anchored `quantities` rows of the deduped claim set. The graph
+        // adds; the LLM never does arithmetic. Honest fall-throughs: no
+        // quantity rows → None (normal reader answers); mixed units are
+        // reported per unit, NEVER collapsed into one fabricated number.
+        AggregationKind::Sum => {
+            use crate::intelligence::aggregation::sum_quantities_by_unit;
+            let ids: Vec<String> = claims.iter().map(|(id, _)| id.clone()).collect();
+            let qrows = graph.get_quantities_for_claims(&ids).ok()?;
+            if qrows.is_empty() {
+                return None; // nothing parsed to sum → honest fall-through
+            }
+            let contributing: Vec<&String> = {
+                let mut seen = std::collections::HashSet::new();
+                qrows
+                    .iter()
+                    .map(|(cid, _, _)| cid)
+                    .filter(|cid| seen.insert(cid.as_str()))
+                    .collect()
+            };
+            let values: Vec<(f64, String)> =
+                qrows.iter().map(|(_, v, u)| (*v, u.clone())).collect();
+            let totals = sum_quantities_by_unit(&values);
+            if totals.is_empty() {
+                return None; // all rows unitless → no honest total exists
+            }
+            let cited = contributing
+                .iter()
+                .take(5)
+                .map(|id| format!("[claim:{id}]"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let lines = totals
+                .iter()
+                .map(|t| format!("- {} {} (from {} recorded value(s))", t.total, t.unit, t.rows))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Total for \"{subject}\" (graph-verified, summed from {} memories):\n{lines}\n{cited}",
+                contributing.len()
+            )
+        }
         AggregationKind::Count => {
             // Cite a few representative memories so the count is grounded.
             let cited = claims

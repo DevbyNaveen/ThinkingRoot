@@ -9104,6 +9104,41 @@ impl GraphStore {
         Ok(out)
     }
 
+    /// Batched `claim id → quantity rows` lookup for the SUM aggregation
+    /// route (memory-SOTA Phase 5). Returns `(claim_id, value, unit)` per
+    /// quantity row; claims with no quantities contribute nothing. Same
+    /// point-query idiom as [`Self::get_sensitivities_for_claims`].
+    pub fn get_quantities_for_claims(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, f64, String)>> {
+        let mut out = Vec::new();
+        for id in ids {
+            let mut params = BTreeMap::new();
+            params.insert("cid".into(), DataValue::Str(id.as_str().into()));
+            let result = self
+                .db
+                .run_script(
+                    "?[value, unit] := *quantities{claim_id, value, unit}, claim_id = $cid",
+                    params,
+                    ScriptMutability::Immutable,
+                )
+                .map_err(|e| {
+                    Error::GraphStorage(format!("get_quantities_for_claims({id}) failed: {e}"))
+                })?;
+            for row in &result.rows {
+                let value = match row.first() {
+                    Some(DataValue::Num(Num::Float(f))) => *f,
+                    Some(DataValue::Num(Num::Int(i))) => *i as f64,
+                    _ => continue,
+                };
+                let unit = row.get(1).map(dv_to_string).unwrap_or_default();
+                out.push((id.clone(), value, unit));
+            }
+        }
+        Ok(out)
+    }
+
     /// Batched `claim id → event_date` lookup for the temporal event-calendar
     /// block. Same point-query-per-id idiom as
     /// [`Self::get_sensitivities_for_claims`] (CozoDB has no list-parameter

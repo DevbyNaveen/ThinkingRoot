@@ -18,6 +18,9 @@ pub enum AggregationKind {
     Count,
     /// "list all…", "what are all…" → the full enumerated set.
     List,
+    /// "how much did I spend…", "total hours…" → an exact per-unit total
+    /// over the `quantities` table (memory-SOTA Phase 5).
+    Sum,
 }
 
 /// Leading/embedded phrases that signal a count question. Ordered longest-first
@@ -34,6 +37,30 @@ const COUNT_TRIGGERS: &[&str] = &[
     "count the",
     "count all",
     "how often",
+];
+
+/// Phrases that signal a quantity-SUM question. Checked BEFORE the count
+/// triggers because "how much did I spend" / "how many hours" are totals
+/// over parsed quantities, not row counts. Deliberately explicit — a
+/// mis-routed Sum falls through honestly (no quantities → normal reader),
+/// but the phrasing set still errs narrow.
+const SUM_TRIGGERS: &[&str] = &[
+    "how much did",
+    "how much money",
+    "how much time",
+    "how much have i spent",
+    "how many hours",
+    "how many minutes",
+    "how many days did",
+    "total cost",
+    "total amount",
+    "total money",
+    "total time",
+    "total hours",
+    "total spent",
+    "in total",
+    "altogether",
+    "sum of",
 ];
 
 /// Phrases that signal a list/enumeration question.
@@ -61,6 +88,11 @@ pub fn classify_aggregation(query: &str) -> Option<AggregationKind> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return None;
+    }
+    // Sum first: "how much did I spend" / "how many hours" would otherwise
+    // false-match the broader count triggers ("how much", "how many").
+    if SUM_TRIGGERS.iter().any(|t| q.contains(t)) {
+        return Some(AggregationKind::Sum);
     }
     if COUNT_TRIGGERS.iter().any(|t| q.contains(t)) {
         return Some(AggregationKind::Count);
@@ -97,6 +129,7 @@ pub fn extract_subject(query: &str, kind: AggregationKind) -> Option<String> {
     let triggers = match kind {
         AggregationKind::Count => COUNT_TRIGGERS,
         AggregationKind::List => LIST_TRIGGERS,
+        AggregationKind::Sum => SUM_TRIGGERS,
     };
     // Remove the (longest matching) trigger phrase.
     if let Some(t) = triggers.iter().find(|t| q.contains(**t)) {
@@ -151,6 +184,54 @@ pub fn dedup_by_canonical_key(claims: &[(String, String)]) -> Vec<(String, Strin
         .filter(|(_, statement)| seen.insert(canonical_statement_key(statement)))
         .cloned()
         .collect()
+}
+
+/// One per-unit total from [`sum_quantities_by_unit`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitTotal {
+    /// Normalized unit key ("usd", "hour", "km"…).
+    pub unit: String,
+    pub total: f64,
+    /// How many quantity rows contributed.
+    pub rows: usize,
+}
+
+/// Normalize a stored unit for sum-grouping: lowercase, and merge the
+/// singular/plural forms of the extractor's word-units ("hours"/"hour").
+/// Symbol units ("%", "ms", "usd") pass through lowercased.
+fn unit_key(unit: &str) -> String {
+    let u = unit.trim().to_lowercase();
+    const WORDY: &[&str] = &["second", "minute", "hour", "day", "user", "req", "core"];
+    if let Some(stem) = u.strip_suffix('s') {
+        if WORDY.contains(&stem) {
+            return stem.to_string();
+        }
+    }
+    u
+}
+
+/// SUM by unit (memory-SOTA Phase 5): total `(value, unit)` quantity rows
+/// per normalized unit. NEVER sums across units — "3 hours + 40 USD" stays
+/// two totals; collapsing them would be a fabricated number. Output sorted
+/// by row-count descending (dominant unit first), then unit for stability.
+pub fn sum_quantities_by_unit(rows: &[(f64, String)]) -> Vec<UnitTotal> {
+    let mut acc: std::collections::BTreeMap<String, (f64, usize)> =
+        std::collections::BTreeMap::new();
+    for (value, unit) in rows {
+        let key = unit_key(unit);
+        if key.is_empty() {
+            continue;
+        }
+        let e = acc.entry(key).or_insert((0.0, 0));
+        e.0 += value;
+        e.1 += 1;
+    }
+    let mut out: Vec<UnitTotal> = acc
+        .into_iter()
+        .map(|(unit, (total, rows))| UnitTotal { unit, total, rows })
+        .collect();
+    out.sort_by(|a, b| b.rows.cmp(&a.rows).then(a.unit.cmp(&b.unit)));
+    out
 }
 
 #[cfg(test)]
@@ -220,6 +301,47 @@ mod tests {
         // "how many?" with no subject must not be turned into "count everything".
         assert_eq!(extract_subject("how many?", AggregationKind::Count), None);
         assert_eq!(extract_subject("list all", AggregationKind::List), None);
+    }
+
+    #[test]
+    fn classifies_sum_questions_before_count() {
+        for q in [
+            "how much did I spend on bikes?",
+            "how many hours did I drive last month",
+            "what's the total cost of my trips",
+            "how much money went to subscriptions",
+            "total hours spent studying",
+        ] {
+            assert_eq!(classify_aggregation(q), Some(AggregationKind::Sum), "{q}");
+        }
+        // The pre-existing count phrasings must NOT reroute to Sum.
+        assert_eq!(
+            classify_aggregation("How much memory have I stored about Alice"),
+            Some(AggregationKind::Count)
+        );
+        assert_eq!(
+            classify_aggregation("total number of meetings last week"),
+            Some(AggregationKind::Count)
+        );
+    }
+
+    #[test]
+    fn sum_groups_by_unit_never_across() {
+        let rows = vec![
+            (120.0, "USD".to_string()),
+            (80.5, "usd".to_string()),   // case-merged
+            (3.0, "hours".to_string()),
+            (2.0, "hour".to_string()),   // plural-merged
+        ];
+        let totals = sum_quantities_by_unit(&rows);
+        assert_eq!(totals.len(), 2, "USD and hours never collapse: {totals:?}");
+        let usd = totals.iter().find(|t| t.unit == "usd").unwrap();
+        assert!((usd.total - 200.5).abs() < 1e-9);
+        assert_eq!(usd.rows, 2);
+        let hours = totals.iter().find(|t| t.unit == "hour").unwrap();
+        assert!((hours.total - 5.0).abs() < 1e-9);
+        // Empty input → empty output (honest: no fabricated zero-total).
+        assert!(sum_quantities_by_unit(&[]).is_empty());
     }
 
     #[test]
