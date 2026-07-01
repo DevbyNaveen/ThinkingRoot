@@ -8187,6 +8187,15 @@ side referenced. Strict rules:\n\
         let mut seen_entity_ids: HashSet<String> = HashSet::new();
         let mut seen_claim_ids: HashSet<String> = HashSet::new();
 
+        // Memory-SOTA Phase 6: lexical BM25 arm + RRF fusion on the CLAIMS
+        // recall path — the same proven two-arm shape `search_facts` ships
+        // default-ON. Here it gates default-OFF (this is the LongMemEval
+        // retriever path; eval flips it). Dense cosine misses rare-term
+        // claims below the 0.1 cutoff; the lexical arm recovers them.
+        let hybrid_claims = std::env::var("TR_HYBRID_CLAIMS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         {
             let cache = handle.cache.read().await;
             for (key, _metadata, score) in &vector_results {
@@ -8231,6 +8240,74 @@ side referenced. Strict rules:\n\
                             // back to session_dates in the synthesizer.
                             valid_from: 0,
                         });
+                    }
+                }
+            }
+
+            // ── Lexical BM25 arm + RRF fuse (flag-gated, additive). ──
+            if hybrid_claims {
+                // Dense ranked order = insertion order of claim_hits so far.
+                let dense_ids: Vec<String> = claim_hits.iter().map(|h| h.id.clone()).collect();
+                // Bounded corpus scan — same cap + honest warn as search_facts.
+                const SCAN_MAX: usize = 50_000;
+                let docs: Vec<(String, String)> = cache
+                    .all_claims()
+                    .take(SCAN_MAX)
+                    .map(|c| (c.id.clone(), c.statement.clone()))
+                    .collect();
+                let ranked = crate::intelligence::reranker::bm25_rank(query, &docs);
+                let mut lex_ids: Vec<String> = Vec::new();
+                for (id, _bm25) in ranked.into_iter().take(top_k * 3) {
+                    if seen_claim_ids.contains(&id) {
+                        lex_ids.push(id); // already a (scope-checked) dense hit
+                        continue;
+                    }
+                    let Some(c) = cache.claim_by_id(&id) else {
+                        continue;
+                    };
+                    let in_scope = allowed_source_ids.is_empty()
+                        || allowed_source_ids
+                            .iter()
+                            .any(|sid| c.source_uri.contains(sid.as_str()));
+                    if !in_scope {
+                        continue;
+                    }
+                    seen_claim_ids.insert(id.clone());
+                    lex_ids.push(id.clone());
+                    claim_hits.push(ClaimSearchHit {
+                        id: id.clone(),
+                        statement: c.statement.clone(),
+                        claim_type: c.claim_type.clone(),
+                        confidence: c.confidence,
+                        source_uri: c.source_uri.clone(),
+                        // Placeholder — the fused ramp below settles it.
+                        relevance: 0.5,
+                        valid_from: 0,
+                    });
+                }
+                // RRF-fuse the two ranked lists, reorder, and bake the fused
+                // order into `relevance` as a monotonic ramp (the caller's
+                // global relevance sort must preserve it) — the exact idiom
+                // proven on search_facts.
+                if !lex_ids.is_empty() {
+                    let fused =
+                        crate::intelligence::reranker::rrf_fuse(&[&dense_ids, &lex_ids], 60.0);
+                    let mut by_id: std::collections::HashMap<String, ClaimSearchHit> =
+                        claim_hits.drain(..).map(|h| (h.id.clone(), h)).collect();
+                    claim_hits = fused.into_iter().filter_map(|id| by_id.remove(&id)).collect();
+                    // Anything neither list surfaced (shouldn't happen) drops.
+                    let n = claim_hits.len();
+                    if n > 0 {
+                        let hi = claim_hits
+                            .iter()
+                            .map(|h| h.relevance)
+                            .fold(0.0_f32, f32::max)
+                            .clamp(0.05, 1.0);
+                        let lo = (hi * 0.6).max(0.05);
+                        for (i, h) in claim_hits.iter_mut().enumerate() {
+                            let t = if n > 1 { i as f32 / (n - 1) as f32 } else { 0.0 };
+                            h.relevance = hi - t * (hi - lo);
+                        }
                     }
                 }
             }
