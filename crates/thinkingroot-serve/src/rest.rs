@@ -5697,6 +5697,19 @@ async fn finalize_successful_compile(
                 ),
             }
         });
+
+        // Memory-SOTA Phase 7: compile-triggered atomic-fact drain. The
+        // compile just enqueued its truly-changed sources (Phase 1d); start
+        // enriching NOW instead of waiting up to 30 s for the poller's next
+        // tick and then trickling one batch per tick. Background task, same
+        // per-batch engine-read-lock discipline as the poller (which stays
+        // as the retry fallback). Kills the "compile says done but facts
+        // silently aren't ready for minutes" dead zone.
+        let drain_engine = state.engine.clone();
+        let drain_ws = status_name.to_string();
+        tokio::spawn(async move {
+            crate::maintenance::drain_atomic_extract_now(drain_engine, &drain_ws).await;
+        });
     }
 
     if remount_ok {

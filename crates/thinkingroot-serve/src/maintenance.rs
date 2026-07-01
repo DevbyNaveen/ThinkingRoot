@@ -1084,6 +1084,60 @@ impl PeriodicTask for AtomicExtractTask {
     }
 }
 
+/// Drain THIS workspace's `atomic_extract_queue` to empty, right now
+/// (memory-SOTA Phase 7 — compile-triggered enrichment). Called from
+/// `finalize_successful_compile` so facts start landing the moment a compile
+/// finishes instead of waiting up to `TR_ATOMIC_EXTRACT_SECS` (30 s) for the
+/// poller's next tick and then trickling at one batch per tick. The periodic
+/// [`spawn_atomic_extract`] task stays as the fallback for sources that
+/// failed mid-drain (its retry/backoff semantics are unchanged).
+///
+/// Same flag + batch knobs as the poller (`TR_ATOMIC_EXTRACT` default-ON,
+/// `TR_ATOMIC_EXTRACT_BATCH` default 4 — the batch bound is the LLM
+/// rate-limit guard, so the drain loops batches rather than widening them).
+/// Bounded at 500 rounds as a runaway backstop; errors end the drain (the
+/// poller picks the queue back up on its next tick).
+pub async fn drain_atomic_extract_now(
+    engine: Arc<tokio::sync::RwLock<crate::engine::QueryEngine>>,
+    ws: &str,
+) {
+    let enabled = std::env::var("TR_ATOMIC_EXTRACT")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    let batch_limit = std::env::var("TR_ATOMIC_EXTRACT_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4usize);
+    let started = std::time::Instant::now();
+    let mut total = 0usize;
+    for _round in 0..500 {
+        // Engine read lock taken fresh per batch, never held across the LLM
+        // calls inside `extract_atomic_facts_once` — same discipline as the
+        // periodic task's per-workspace walk.
+        let res = {
+            let eng = engine.read().await;
+            eng.extract_atomic_facts_once(ws, batch_limit).await
+        };
+        match res {
+            Ok(0) => break, // queue empty — done
+            Ok(n) => total += n,
+            Err(e) => {
+                tracing::warn!(ws = %ws, "post-compile atomic drain: {e} — poller will retry");
+                break;
+            }
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            ws = %ws, facts = total, elapsed_ms = started.elapsed().as_millis() as u64,
+            "post-compile atomic drain complete"
+        );
+    }
+}
+
 /// Spawn the async atomic-fact extractor. Default-ON (`TR_ATOMIC_EXTRACT=0`
 /// disables it, in lockstep with the compile-side enqueue). `TR_ATOMIC_EXTRACT_SECS`
 /// = tick cadence (default 30s — facts should land seconds after a compile);
