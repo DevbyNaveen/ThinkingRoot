@@ -119,6 +119,40 @@ pub fn extract_subject(query: &str, kind: AggregationKind) -> Option<String> {
     Some(subject.join(" "))
 }
 
+/// Canonical dedup key for COUNT DISTINCT (memory-SOTA Phase 3): the same
+/// real-world item restated across sessions ("Bought a black jacket." /
+/// "bought the black jacket") must count ONCE. Lowercases, strips punctuation
+/// and pure-glue articles, keeps content words IN ORDER.
+///
+/// Deliberately conservative: different verbs / different objects stay
+/// distinct keys. Under-dedup degrades to today's behaviour (a duplicate
+/// counted twice); over-dedup would FABRICATE a lower count — the worse
+/// failure, so we never sort or stem.
+pub fn canonical_statement_key(statement: &str) -> String {
+    // Articles + trivial glue only. NOT the full SUBJECT_STOPWORDS list —
+    // "I" vs "we", "my" vs "your" can distinguish real items.
+    const GLUE: &[&str] = &["a", "an", "the"];
+    statement
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty() && !GLUE.contains(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// COUNT DISTINCT over `(claim_id, statement)` rows: collapse rows sharing a
+/// canonical statement key, keeping the first row of each group. Returns the
+/// deduplicated rows in input order — `out.len()` is the distinct-item count.
+pub fn dedup_by_canonical_key(claims: &[(String, String)]) -> Vec<(String, String)> {
+    let mut seen = std::collections::HashSet::new();
+    claims
+        .iter()
+        .filter(|(_, statement)| seen.insert(canonical_statement_key(statement)))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +220,45 @@ mod tests {
         // "how many?" with no subject must not be turned into "count everything".
         assert_eq!(extract_subject("how many?", AggregationKind::Count), None);
         assert_eq!(extract_subject("list all", AggregationKind::List), None);
+    }
+
+    #[test]
+    fn canonical_key_collapses_restatements_keeps_distinct_items() {
+        // Same item restated (article/punct/case noise) → same key.
+        assert_eq!(
+            canonical_statement_key("Bought a black jacket."),
+            canonical_statement_key("bought the black jacket")
+        );
+        // Different object → distinct key (never over-collapse).
+        assert_ne!(
+            canonical_statement_key("bought a black jacket"),
+            canonical_statement_key("bought a blue jacket")
+        );
+        // Different verb → distinct key (conservative: no stemming/synonyms).
+        assert_ne!(
+            canonical_statement_key("bought a jacket"),
+            canonical_statement_key("returned a jacket")
+        );
+        // Word order preserved — never sorted.
+        assert_ne!(
+            canonical_statement_key("alice emailed bob"),
+            canonical_statement_key("bob emailed alice")
+        );
+    }
+
+    #[test]
+    fn dedup_by_canonical_key_counts_distinct_items() {
+        let claims = vec![
+            ("c1".to_string(), "Bought a black jacket.".to_string()),
+            ("c2".to_string(), "bought the black jacket".to_string()), // dup of c1
+            ("c3".to_string(), "bought a blue scarf".to_string()),
+            ("c4".to_string(), "returned the blue scarf".to_string()),
+        ];
+        let distinct = dedup_by_canonical_key(&claims);
+        assert_eq!(distinct.len(), 3, "off-by-1 fixed: dup collapses");
+        // First occurrence wins; input order preserved.
+        assert_eq!(distinct[0].0, "c1");
+        assert_eq!(distinct[1].0, "c3");
+        assert_eq!(distinct[2].0, "c4");
     }
 }

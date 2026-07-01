@@ -799,10 +799,15 @@ async fn try_aggregation_answer(
     let kind = classify_aggregation(req.question)?;
     let subject = extract_subject(req.question, kind)?;
     let graph = engine.graph_store(req.workspace).await?;
-    let (entities_resolved, claims) = graph.aggregate_claims_for_keyword(&subject).ok()?;
+    let (entities_resolved, raw_claims) = graph.aggregate_claims_for_keyword(&subject).ok()?;
     if entities_resolved == 0 {
         return None; // unresolved subject → honest fall-through
     }
+    // COUNT DISTINCT (memory-SOTA Phase 3): the same real-world item restated
+    // across sessions collapses to one row — the graph counts items, not
+    // mentions. Conservative key (see `canonical_statement_key`): under-dedup
+    // degrades to the old behaviour, never fabricates a lower count.
+    let claims = crate::intelligence::aggregation::dedup_by_canonical_key(&raw_claims);
 
     // Build grounding so the citation gate verifies the markers we emit.
     let grounding: Vec<crate::engine::ClaimSearchHit> = claims
