@@ -43,8 +43,10 @@ import {
   workspaceCompile,
   workspaceCompileStatus,
   workspaceCompileStop,
+  workspaceEnrichmentStatus,
   workspaceList,
   type CompileProgress,
+  type EnrichmentStatus,
   type IncrementalSummary,
   type WorkspaceView,
 } from "@/lib/tauri";
@@ -620,6 +622,48 @@ function CompilationProgressIndicator() {
   const progress = useApp((s) => s.compileProgress);
   const [stopping, setStopping] = useState(false);
   /**
+   * Second bar segment (memory-SOTA Phase 7): post-compile LLM enrichment.
+   * Mechanical compile finishing means the workspace is queryable NOW; the
+   * atomic-fact drain keeps enriching in the background. Poll the daemon's
+   * per-source progress while sources remain, so "done" never silently
+   * hides minutes of in-flight enrichment. Null = not polling / nothing
+   * to show (pre-Phase-7 render, byte-identical).
+   */
+  const [enrichment, setEnrichment] = useState<EnrichmentStatus | null>(null);
+
+  useEffect(() => {
+    if (progress?.phase !== "done") {
+      setEnrichment(null);
+      return;
+    }
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let ticks = 0;
+    const POLL_MS = 2000;
+    const MAX_TICKS = 300; // ~10 min backstop — the poller owns stragglers
+    const tick = async () => {
+      let status: EnrichmentStatus;
+      try {
+        status = await workspaceEnrichmentStatus();
+      } catch {
+        // Daemon unreachable / no active workspace — stop quietly. The
+        // enrichment itself is daemon-side and unaffected.
+        return;
+      }
+      if (stopped) return;
+      setEnrichment(status);
+      ticks += 1;
+      if (status.enriching > 0 && ticks < MAX_TICKS) {
+        timer = setTimeout(tick, POLL_MS);
+      }
+    };
+    timer = setTimeout(tick, 500);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [progress?.phase]);
+  /**
    * Per-group phase start clock for ETA computation. Reset whenever
    * `compilePhaseGroup(progress.phase)` changes — every new umbrella
    * phase gets a fresh wall clock so the rate calculation reflects
@@ -1058,6 +1102,39 @@ function CompilationProgressIndicator() {
             graph is partial.
           </p>
         )}
+      {/* Second segment: post-compile LLM enrichment. The workspace is
+          queryable the moment mechanical compile is done; this line keeps
+          the still-running fact extraction honest instead of invisible. */}
+      {progress.phase === "done" && enrichment && enrichment.enriching > 0 && (
+        <div className="flex items-center gap-1.5 font-mono text-[10px] text-muted-foreground">
+          <Loader2
+            className="size-3 animate-spin text-primary motion-reduce:animate-none"
+            aria-hidden
+          />
+          <span>
+            Enriching memory · {enrichment.total - enrichment.enriching} /{" "}
+            {enrichment.total} sources
+          </span>
+        </div>
+      )}
+      {progress.phase === "done" &&
+        enrichment &&
+        enrichment.enriching === 0 &&
+        enrichment.ready > 0 && (
+          <div className="flex items-center gap-1.5 font-mono text-[10px] text-muted-foreground">
+            <CheckCircle2
+              className="size-3 text-emerald-600 dark:text-emerald-400"
+              aria-hidden
+            />
+            <span>Memory enriched · {enrichment.ready} sources</span>
+          </div>
+        )}
+      {progress.phase === "done" && enrichment && enrichment.failed > 0 && (
+        <p className="text-[10px] leading-snug text-amber-700 dark:text-amber-300/95">
+          {enrichment.failed} source{enrichment.failed === 1 ? "" : "s"} failed
+          enrichment — the background extractor will retry.
+        </p>
+      )}
       {progress.phase === "done" && progress.incremental_summary && (
         <CompileSummaryPanel summary={progress.incremental_summary} />
       )}

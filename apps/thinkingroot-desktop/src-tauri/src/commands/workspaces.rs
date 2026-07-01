@@ -1267,6 +1267,55 @@ pub async fn workspace_compile_status(app: AppHandle) -> Result<CompileStatus, S
     })
 }
 
+/// Post-compile LLM enrichment progress (memory-SOTA Phase 7 second bar
+/// segment). Reduces the daemon's per-source `source-progress` rows to
+/// phase counts: `enriching` = sources still in the "facts"/"summary"
+/// pipeline, `ready` = enriched, `failed` = gave up (poller retries).
+/// Field names match the TypeScript `EnrichmentStatus` binding in
+/// `apps/thinkingroot-desktop/ui/src/lib/tauri.ts`.
+#[derive(Debug, Serialize)]
+pub struct EnrichmentStatus {
+    pub enriching: usize,
+    pub ready: usize,
+    pub failed: usize,
+    pub total: usize,
+}
+
+#[tauri::command]
+pub async fn workspace_enrichment_status(app: AppHandle) -> Result<EnrichmentStatus, String> {
+    use crate::commands::sidecar_client::SidecarClient;
+
+    #[derive(Deserialize)]
+    struct Row {
+        phase: String,
+    }
+    #[derive(Deserialize)]
+    struct Items {
+        items: Vec<Row>,
+    }
+
+    let sc = SidecarClient::ensure_active(&app).await?;
+    let data: Items = sc
+        .get(&format!("/api/v1/ws/{}/source-progress", sc.workspace))
+        .await?;
+    let mut status = EnrichmentStatus {
+        enriching: 0,
+        ready: 0,
+        failed: 0,
+        total: data.items.len(),
+    };
+    for row in &data.items {
+        match row.phase.as_str() {
+            "facts" | "summary" => status.enriching += 1,
+            "failed" => status.failed += 1,
+            // "ready" + any future phase name count as done — the segment
+            // must never spin forever on an unknown state.
+            _ => status.ready += 1,
+        }
+    }
+    Ok(status)
+}
+
 fn map_progress(_workspace: &str, event: ProgressEvent) -> Option<CompileProgress> {
     match event {
         // The unified ticker event — single canonical path. Mapped

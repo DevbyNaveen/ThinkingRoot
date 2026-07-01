@@ -568,6 +568,25 @@ export async function workspaceCompileStatus(): Promise<CompileStatus> {
 }
 
 /**
+ * Post-compile LLM enrichment progress — the second bar segment.
+ * `enriching` = sources still being fact-extracted, `ready` = enriched,
+ * `failed` = gave up after retries (the background poller re-attempts).
+ * Field names match the Rust `EnrichmentStatus` struct in
+ * `src-tauri/src/commands/workspaces.rs`.
+ */
+export interface EnrichmentStatus {
+  enriching: number;
+  ready: number;
+  failed: number;
+  total: number;
+}
+
+/** Snapshot the active workspace's post-compile enrichment progress. */
+export async function workspaceEnrichmentStatus(): Promise<EnrichmentStatus> {
+  return invoke<EnrichmentStatus>("workspace_enrichment_status");
+}
+
+/**
  * Mirror of Rust `thinkingroot_core::IncrementalSummary` — the structured
  * delta surfaced at the end of every successful compile. Always populated
  * (even on the no-edits-since-last-compile early-return path), so React

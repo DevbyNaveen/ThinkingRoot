@@ -201,6 +201,7 @@ pub fn run() {
             commands::workspaces::workspace_compile,
             commands::workspaces::workspace_compile_stop,
             commands::workspaces::workspace_compile_status,
+            commands::workspaces::workspace_enrichment_status,
             commands::fs::fs_list_dir,
             commands::fs::fs_read_text,
             commands::git::git_branches,
