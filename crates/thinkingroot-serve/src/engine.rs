@@ -8948,6 +8948,11 @@ side referenced. Strict rules:\n\
                 Vec::new()
             } else {
                 use crate::intelligence::fact_supersession::{self, FactRef};
+                // Phase 4a: event-time ordering. A statement naming an absolute
+                // date carries its EVENT time (same mechanical extractor that
+                // feeds the `fact_event_date` sidecar below); when both sides
+                // of a collision are dated, event order — not ingest order —
+                // decides who may supersede whom.
                 let new_refs: Vec<FactRef> = facts
                     .iter()
                     .map(|f| FactRef {
@@ -8957,12 +8962,22 @@ side referenced. Strict rules:\n\
                         object: f.object.clone(),
                         statement: f.statement.clone(),
                         valid_from: now, // newly extracted ⇒ the newest assertion
+                        event_date: thinkingroot_extract::temporal::extract_event_date(
+                            &f.statement,
+                        )
+                        .map(|dt| dt.timestamp() as f64),
                     })
                     .collect();
                 // Existing LIVE facts from OTHER sources only (cross-source — the
                 // per-source `supersede_facts_not_in` handles same-source re-extract).
                 let existing: Vec<FactRef> = {
                     let storage = handle.storage.lock().await;
+                    let event_dates: std::collections::HashMap<String, f64> = storage
+                        .graph
+                        .get_all_fact_event_dates()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
                     storage
                         .graph
                         .get_all_atomic_facts()
@@ -8970,6 +8985,7 @@ side referenced. Strict rules:\n\
                         .into_iter()
                         .filter(|f| f.is_live() && f.source_id != sid)
                         .map(|f| FactRef {
+                            event_date: event_dates.get(&f.id).copied(),
                             id: f.id,
                             subject: f.subject,
                             predicate: f.predicate,

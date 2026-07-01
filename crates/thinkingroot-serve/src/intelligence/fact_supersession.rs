@@ -39,6 +39,11 @@ pub struct FactRef {
     pub statement: String,
     /// When the fact became valid (for "older" ordering).
     pub valid_from: f64,
+    /// Explicit EVENT time (epoch secs) mechanically extracted from the
+    /// statement (`fact_event_date` sidecar / `extract_event_date`), when the
+    /// statement names an absolute date. `None` = undated — ordering falls
+    /// back to ingest time.
+    pub event_date: Option<f64>,
 }
 
 /// A candidate update: a NEW fact and an OLDER existing fact sharing a
@@ -57,9 +62,30 @@ fn norm(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
+/// Is `e` (existing) strictly OLDER than `n` (new) — i.e. is `n` a candidate
+/// UPDATE of `e`? (Memory-SOTA Phase 4a: event-time beats ingest-time.)
+///
+/// The stale-value failure this fixes: "I worked at Orion until March" said
+/// in session 5, "I work at Acme since April" in session 2 — ingest order is
+/// backwards, EVENT order is truth. Rules, adversarial-review guard included:
+///
+/// - **Both explicitly dated** → compare event dates (the truth axis).
+/// - **Old dated, new undated** → NEVER a candidate: an undated newcomer's
+///   ingest-time fallback must not close an explicitly-dated predecessor.
+/// - **Otherwise** (new dated / neither dated) → today's ingest-time
+///   ordering — the pre-Phase-4a behaviour, unchanged.
+fn is_older(e: &FactRef, n: &FactRef) -> bool {
+    match (e.event_date, n.event_date) {
+        (Some(ev_e), Some(ev_n)) => ev_e < ev_n,
+        (Some(_), None) => false, // guard: dated predecessor is protected
+        _ => e.valid_from < n.valid_from,
+    }
+}
+
 /// Find `(subject, predicate)` slot collisions: existing LIVE facts that share a
 /// new fact's subject+predicate but assert a different object and are strictly
-/// older. Pure. Capped at [`MAX_COLLISIONS`] (oldest-first is irrelevant; we just
+/// older (per [`is_older`] — event-time when both dated, else ingest-time).
+/// Pure. Capped at [`MAX_COLLISIONS`] (oldest-first is irrelevant; we just
 /// bound the count). Self-collisions (same fact id) are excluded.
 pub fn find_collisions(new: &[FactRef], existing: &[FactRef]) -> Vec<SlotCollision> {
     let mut out = Vec::new();
@@ -75,7 +101,7 @@ pub fn find_collisions(new: &[FactRef], existing: &[FactRef]) -> Vec<SlotCollisi
             if norm(&e.subject) == ns
                 && norm(&e.predicate) == np
                 && norm(&e.object) != no
-                && e.valid_from < n.valid_from
+                && is_older(e, n)
             {
                 out.push(SlotCollision {
                     new_statement: n.statement.clone(),
@@ -193,6 +219,14 @@ mod tests {
             object: obj.into(),
             statement: format!("{subj} {pred} {obj}"),
             valid_from: vf,
+            event_date: None,
+        }
+    }
+
+    fn fr_dated(id: &str, subj: &str, pred: &str, obj: &str, vf: f64, ev: f64) -> FactRef {
+        FactRef {
+            event_date: Some(ev),
+            ..fr(id, subj, pred, obj, vf)
         }
     }
 
@@ -222,6 +256,43 @@ mod tests {
         let f = fr("x", "A", "is", "B", 10.0);
         // Same id present on both sides → never collides with itself.
         assert!(find_collisions(&[f.clone()], &[f]).is_empty());
+    }
+
+    #[test]
+    fn event_time_beats_ingest_time_when_both_dated() {
+        // Sessions discussed out of order: the OLD row was INGESTED later
+        // (vf 200 > 100) but its EVENT is earlier (March < April). Event
+        // order is truth → collision fires despite backwards ingest order.
+        let new = vec![fr_dated("n1", "Priya", "works at", "Acme", 100.0, 1_680_300_000.0)];
+        let existing = vec![fr_dated("o1", "Priya", "works at", "Orion", 200.0, 1_677_600_000.0)];
+        let c = find_collisions(&new, &existing);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].old_id, "o1");
+        // And the reverse: an event-OLDER new fact must NOT supersede an
+        // event-newer existing one, even if ingested later.
+        let new = vec![fr_dated("n2", "Priya", "works at", "Zeta", 300.0, 1_600_000_000.0)];
+        let existing = vec![fr_dated("o2", "Priya", "works at", "Acme", 100.0, 1_680_300_000.0)];
+        assert!(find_collisions(&new, &existing).is_empty());
+    }
+
+    #[test]
+    fn undated_newcomer_never_closes_dated_predecessor() {
+        // Guard (adversarial-review revision): the existing fact carries an
+        // explicit event date; the new fact is undated (ingest-time fallback
+        // only). Even with a newer valid_from, no collision.
+        let new = vec![fr("n1", "Priya", "works at", "Acme", 500.0)];
+        let existing = vec![fr_dated("o1", "Priya", "works at", "Orion", 50.0, 1_677_600_000.0)];
+        assert!(find_collisions(&new, &existing).is_empty());
+    }
+
+    #[test]
+    fn dated_newcomer_vs_undated_old_falls_back_to_ingest_order() {
+        // New is dated, old is not → pre-Phase-4a ingest ordering decides.
+        let new = vec![fr_dated("n1", "Priya", "works at", "Acme", 100.0, 1_680_300_000.0)];
+        let older = vec![fr("o1", "Priya", "works at", "Orion", 50.0)];
+        assert_eq!(find_collisions(&new, &older).len(), 1);
+        let newer = vec![fr("o2", "Priya", "works at", "Orion", 500.0)];
+        assert!(find_collisions(&new, &newer).is_empty());
     }
 
     #[test]
