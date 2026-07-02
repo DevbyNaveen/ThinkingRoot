@@ -6042,24 +6042,38 @@ fn spawn_detached_compile(
     user_cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
-        // Bridge: pipeline → mpsc → broadcast fan-out.
-        //
-        // IMPORTANT: we do NOT write phase transitions to the durable row
-        // mid-compile. The workspace `graph.db` is SQLite (single writer); a
-        // concurrent `compile_jobs` write races the pipeline's own `sources`
-        // persist and one side fails with "database is locked" (cozo-ce's pool
-        // connections don't inherit a busy_timeout). The durable row therefore
-        // carries START + TERMINAL status only — both written when the pipeline
-        // is NOT touching the DB. Live, fine-grained phase still reaches the
-        // console through this broadcast (the SSE observer); a client that
-        // re-attaches after a reload sees the coarse `running` status from the
-        // row until the SSE reconnects (~instant).
+        // Bridge: pipeline → mpsc → broadcast fan-out, PLUS durable coarse
+        // phase persistence. The fleet is RocksDB-only (concurrent writers)
+        // and `compile_jobs` writes go through the same per-workspace storage
+        // mutex as the pipeline's own persists, so the old SQLite
+        // "database is locked" reason for START+TERMINAL-only rows is gone.
+        // Only phase TRANSITIONS are written (a handful per run), so a
+        // re-attaching client sees real progress instead of an eternal
+        // `starting`.
         let (mpsc_tx, mut mpsc_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::pipeline::ProgressEvent>();
         let bridge = {
             let bcast = bcast_tx.clone();
+            let bstate = state.clone();
+            let bws = ws_key.clone();
+            let bjob = job_id.clone();
             tokio::spawn(async move {
+                let mut last_phase = String::new();
                 while let Some(ev) = mpsc_rx.recv().await {
+                    if let Some((phase, sources)) = durable_phase_of(&ev) {
+                        if phase != last_phase {
+                            last_phase = phase.to_string();
+                            if let Err(e) = bstate
+                                .engine
+                                .read()
+                                .await
+                                .update_compile_job_phase(&bws, &bjob, phase, sources)
+                                .await
+                            {
+                                tracing::debug!(ws = %bws, "compile phase persist skipped: {e}");
+                            }
+                        }
+                    }
                     // Err only means "no live observers" — fine, drop it.
                     let _ = bcast.send(ev);
                 }
@@ -6074,18 +6088,36 @@ fn spawn_detached_compile(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1800);
 
-        let compile_fut =
-            run_unified_compile(state.clone(), req, Some(mpsc_tx), user_cancel.clone());
-        tokio::pin!(compile_fut);
-        let (_name, outcome) = tokio::select! {
-            res = &mut compile_fut => res,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(max_secs)) => {
-                tracing::warn!(ws = %ws_key, "compile exceeded TR_COMPILE_MAX_SECS={max_secs}s — cancelling");
-                user_cancel.cancel();
-                // Let the pipeline wind down cleanly to Cancelled.
-                (&mut compile_fut).await
+        // Panic isolation: the pipeline runs in its OWN task so that a panic
+        // anywhere inside it cannot skip the terminal bookkeeping below — a
+        // leaked `running` row was the ghost-"Compiling…" bug (stuck banner,
+        // bricked Compile button, engine pinned un-pausable by /busy).
+        let work_state = state.clone();
+        let work_cancel = user_cancel.clone();
+        let work_ws = ws_key.clone();
+        let work = tokio::spawn(async move {
+            let compile_fut =
+                run_unified_compile(work_state, req, Some(mpsc_tx), work_cancel.clone());
+            tokio::pin!(compile_fut);
+            tokio::select! {
+                res = &mut compile_fut => res,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(max_secs)) => {
+                    tracing::warn!(ws = %work_ws, "compile exceeded TR_COMPILE_MAX_SECS={max_secs}s — cancelling");
+                    work_cancel.cancel();
+                    // Let the pipeline wind down cleanly to Cancelled.
+                    (&mut compile_fut).await
+                }
+            }
+        });
+        let outcome = match work.await {
+            Ok((_name, outcome)) => outcome,
+            Err(join_err) => {
+                tracing::error!(ws = %ws_key, "compile task panicked/aborted: {join_err}");
+                UnifiedCompileOutcome::Failed(format!("compile task panicked: {join_err}"))
             }
         };
+        // `mpsc_tx` lives inside the work task; either way it is dropped by
+        // now, so the bridge drains and exits — this await cannot hang.
         let _ = bridge.await;
 
         let (status, error) = match &outcome {
@@ -6100,7 +6132,9 @@ fn spawn_detached_compile(
             .finish_compile_job(&ws_key, &job_id, status, &error)
             .await
         {
-            tracing::warn!(ws = %ws_key, "finish_compile_job failed: {e}");
+            // Not fatal: the row stays `running` with no registry entry, so
+            // the compile-job reaper marks it `interrupted` within one sweep.
+            tracing::warn!(ws = %ws_key, "finish_compile_job failed (reaper will settle it): {e}");
         }
 
         // Remove from the registry LAST: dropping the map's broadcast sender
@@ -6111,23 +6145,99 @@ fn spawn_detached_compile(
     });
 }
 
+/// Map a live pipeline event to the coarse durable phase token (and, when the
+/// event carries it, the run's source count). `None` = not a phase boundary —
+/// high-frequency progress events are forwarded to SSE only.
+fn durable_phase_of(ev: &crate::pipeline::ProgressEvent) -> Option<(&'static str, Option<i64>)> {
+    use crate::pipeline::ProgressEvent as E;
+    Some(match ev {
+        E::ParseStart => ("reading", None),
+        E::ParseComplete { files } => ("diffing", Some(*files as i64)),
+        E::ExtractionStart { .. } => ("extracting", None),
+        E::LinkingStart { .. } => ("linking", None),
+        E::VectorProgress { .. } | E::VectorUpdateDone { .. } => ("indexing", None),
+        E::CompilationProgress { .. } | E::CompilationDone { .. } => ("compiling", None),
+        E::VerificationDone { .. } => ("verifying", None),
+        _ => return None,
+    })
+}
+
 /// `POST /api/v1/ws/{ws}/compile/cancel` — deliberate, user-initiated cancel
 /// of a running compile. Distinct from the client disconnecting (which no
-/// longer cancels anything). 404 if no compile is active for the workspace.
+/// longer cancels anything). Three layers, most-live first:
+///  1. registry hit on the raw ws key → cancel the live task's token;
+///  2. durable `running` rows matched to registry entries by `job_id`
+///     (alias-proof: the registry is keyed by the RESOLVED ws) → cancel;
+///  3. durable `running` rows with NO live task (leaked by a crash) →
+///     force-finish `cancelled`, so the console always has a working
+///     "clear stuck state" path instead of a dead CANCEL button.
+/// 404 only when none of the three find anything.
 async fn cancel_compile_handler(
     State(state): State<Arc<AppState>>,
     Path(ws): Path<String>,
 ) -> Response {
+    let mut cancelled_live: Vec<String> = Vec::new();
+    let mut cleared_stale: Vec<String> = Vec::new();
+
     if let Some(ac) = state.active_compiles.read().await.get(&ws) {
         ac.user_cancel.cancel();
-        ok_response(serde_json::json!({ "cancelled": ws, "job_id": ac.job_id })).into_response()
-    } else {
-        err_response(
+        cancelled_live.push(ac.job_id.clone());
+    }
+
+    let running = state
+        .engine
+        .read()
+        .await
+        .list_running_compile_jobs(&ws)
+        .await
+        .unwrap_or_default();
+    {
+        let reg = state.active_compiles.read().await;
+        for job in &running {
+            if cancelled_live.contains(&job.job_id) {
+                continue;
+            }
+            if let Some(ac) = reg.values().find(|a| a.job_id == job.job_id) {
+                ac.user_cancel.cancel();
+                cancelled_live.push(job.job_id.clone());
+            }
+        }
+    }
+    for job in &running {
+        if cancelled_live.contains(&job.job_id) {
+            continue;
+        }
+        // Leaked row — no live task owns it. Terminal rows are immutable at
+        // the storage layer, so racing the job's own finish is harmless.
+        match state
+            .engine
+            .read()
+            .await
+            .finish_compile_job(&job.ws, &job.job_id, "cancelled", "cleared by user cancel (no live task)")
+            .await
+        {
+            Ok(()) => cleared_stale.push(job.job_id.clone()),
+            Err(e) => {
+                tracing::warn!(ws = %ws, job_id = %job.job_id, "stale compile row clear failed: {e}")
+            }
+        }
+    }
+
+    if cancelled_live.is_empty() && cleared_stale.is_empty() {
+        return err_response(
             StatusCode::NOT_FOUND,
             "COMPILE_NOT_ACTIVE",
             &format!("no in-flight compile for workspace '{ws}'"),
-        )
+        );
     }
+    ok_response(serde_json::json!({
+        "cancelled": ws,
+        // Back-compat: first cancelled/cleared id in the legacy field.
+        "job_id": cancelled_live.first().or(cleared_stale.first()),
+        "live": cancelled_live,
+        "cleared_stale": cleared_stale,
+    }))
+    .into_response()
 }
 
 /// `GET /api/v1/ws/{ws}/compile/jobs/{job_id}` — durable compile-job status so

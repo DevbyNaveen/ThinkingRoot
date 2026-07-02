@@ -134,12 +134,23 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Update the live phase of a running job (cheap, called per phase
-    /// transition by the compile forwarder). No-op if the job is gone.
-    pub fn update_compile_job_phase(&self, job_id: &str, phase: &str, now: f64) -> Result<()> {
+    /// Update the live phase (and, when known, the source count) of a running
+    /// job — called per phase transition by the compile forwarder. No-op if
+    /// the job is gone OR already terminal: a late progress event must never
+    /// resurrect a finished/cancelled row.
+    pub fn update_compile_job_phase(
+        &self,
+        job_id: &str,
+        phase: &str,
+        source_count: Option<i64>,
+        now: f64,
+    ) -> Result<()> {
         let Some(job) = self.get_compile_job(job_id)? else {
             return Ok(());
         };
+        if job.status != "running" {
+            return Ok(());
+        }
         let row = DataValue::List(vec![
             s(&job.job_id),
             s(&job.ws),
@@ -147,7 +158,7 @@ impl GraphStore {
             s(&job.branch),
             s(&job.status),
             s(phase),
-            i(job.source_count),
+            i(source_count.unwrap_or(job.source_count)),
             f(job.started_at),
             f(now),
             s(&job.error),
@@ -162,7 +173,9 @@ impl GraphStore {
     }
 
     /// Move a job to a terminal status. `done` is the ONLY success value and
-    /// must reflect a genuine successful finish (honesty rule). No-op if gone.
+    /// must reflect a genuine successful finish (honesty rule). No-op if gone
+    /// OR already terminal — terminal rows are immutable, so a racing reaper
+    /// sweep can never clobber a `done` into `interrupted`.
     pub fn finish_compile_job(
         &self,
         job_id: &str,
@@ -173,6 +186,9 @@ impl GraphStore {
         let Some(job) = self.get_compile_job(job_id)? else {
             return Ok(());
         };
+        if job.status != "running" {
+            return Ok(());
+        }
         let row = DataValue::List(vec![
             s(&job.job_id),
             s(&job.ws),
@@ -253,10 +269,15 @@ mod tests {
         assert_eq!(j.host_pid, 4242);
         assert_eq!(store.running_compile_count().unwrap(), 1);
 
-        store.update_compile_job_phase("job1", "extracting", 2.0).unwrap();
+        store.update_compile_job_phase("job1", "extracting", None, 2.0).unwrap();
         let j = store.get_compile_job("job1").unwrap().unwrap();
         assert_eq!(j.phase, "extracting");
         assert_eq!(j.status, "running", "phase update does not change status");
+        assert_eq!(j.source_count, 3, "None keeps the existing source_count");
+
+        store.update_compile_job_phase("job1", "linking", Some(7), 2.5).unwrap();
+        let j = store.get_compile_job("job1").unwrap().unwrap();
+        assert_eq!(j.source_count, 7, "Some(n) updates the source_count");
 
         store.finish_compile_job("job1", "done", "", 3.0).unwrap();
         let j = store.get_compile_job("job1").unwrap().unwrap();
@@ -305,8 +326,27 @@ mod tests {
     fn phase_and_finish_are_noops_when_missing() {
         let (_d, store) = store();
         // Must not error if the job id is unknown (terminal cleanup races).
-        store.update_compile_job_phase("ghost", "reading", 1.0).unwrap();
+        store.update_compile_job_phase("ghost", "reading", None, 1.0).unwrap();
         store.finish_compile_job("ghost", "done", "", 1.0).unwrap();
         assert!(store.get_compile_job("ghost").unwrap().is_none());
+    }
+
+    #[test]
+    fn terminal_rows_are_immutable() {
+        let (_d, store) = store();
+        store.insert_compile_job("j", "main", "/p", "", 1, 1.0, 1).unwrap();
+        store.finish_compile_job("j", "done", "", 2.0).unwrap();
+
+        // A racing reaper must NOT clobber a successful finish…
+        store.finish_compile_job("j", "interrupted", "engine restarted", 3.0).unwrap();
+        let j = store.get_compile_job("j").unwrap().unwrap();
+        assert_eq!(j.status, "done", "terminal status survives a late finish");
+        assert_eq!(j.updated_at, 2.0, "terminal row untouched");
+
+        // …and a late progress event must not resurrect the row either.
+        store.update_compile_job_phase("j", "extracting", Some(9), 4.0).unwrap();
+        let j = store.get_compile_job("j").unwrap().unwrap();
+        assert_eq!(j.updated_at, 2.0);
+        assert_eq!(j.source_count, 1);
     }
 }

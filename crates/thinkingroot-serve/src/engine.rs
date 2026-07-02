@@ -9356,10 +9356,17 @@ side referenced. Strict rules:\n\
     }
 
     /// Update the live phase of a running compile job (cheap, per transition).
-    pub async fn update_compile_job_phase(&self, ws: &str, job_id: &str, phase: &str) -> Result<()> {
+    /// `source_count` when the pipeline learns it (parse/diff complete).
+    pub async fn update_compile_job_phase(
+        &self,
+        ws: &str,
+        job_id: &str,
+        phase: &str,
+        source_count: Option<i64>,
+    ) -> Result<()> {
         let handle = self.get_workspace(ws)?;
         let storage = handle.storage.lock().await;
-        storage.graph.update_compile_job_phase(job_id, phase, now_secs_f64())
+        storage.graph.update_compile_job_phase(job_id, phase, source_count, now_secs_f64())
     }
 
     /// Move a compile job to a terminal status (`done` only on real success).
@@ -9527,21 +9534,36 @@ side referenced. Strict rules:\n\
         total
     }
 
-    /// Boot-sweep: across all mounted workspaces, mark any `running` job owned
-    /// by a DIFFERENT process id (i.e. orphaned by a crash/restart) as
-    /// `interrupted`. Honest recovery — the run is surfaced for a Retry, never
-    /// reported as `done`. Returns the number reaped.
-    pub async fn sweep_interrupted_compile_jobs(&self, current_pid: i64) -> usize {
+    /// Orphan sweep: across all mounted workspaces, mark any `running` job
+    /// with NO live task in the in-memory `active_compiles` registry as
+    /// `interrupted`. Registry truth, not pid truth — inside a container the
+    /// daemon gets the SAME pid every boot, so the old `host_pid` comparison
+    /// could never distinguish a crashed run from a live one. The registry
+    /// entry is inserted BEFORE the durable row, so a running row absent from
+    /// `active_job_ids` can only mean the owning task finished, panicked, or
+    /// belonged to a previous process. Honest recovery — the run is surfaced
+    /// for a Retry, never reported as `done` (terminal rows are immutable at
+    /// the storage layer, so racing a just-finished job is harmless).
+    /// Returns the number reaped.
+    pub async fn sweep_orphaned_compile_jobs(
+        &self,
+        active_job_ids: &std::collections::HashSet<String>,
+    ) -> usize {
         let mut reaped = 0usize;
         for ws in self.mounted_workspace_names() {
             let Ok(handle) = self.get_workspace(&ws) else { continue };
             let storage = handle.storage.lock().await;
             let running = storage.graph.list_running_compile_jobs().unwrap_or_default();
             for job in running {
-                if job.host_pid != current_pid {
+                if !active_job_ids.contains(&job.job_id) {
                     if storage
                         .graph
-                        .finish_compile_job(&job.job_id, "interrupted", "engine restarted", now_secs_f64())
+                        .finish_compile_job(
+                            &job.job_id,
+                            "interrupted",
+                            "compile task died without finishing (engine restart or crash)",
+                            now_secs_f64(),
+                        )
                         .is_ok()
                     {
                         reaped += 1;
